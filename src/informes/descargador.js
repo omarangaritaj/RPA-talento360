@@ -30,45 +30,92 @@ import { dirname, join } from 'node:path';
 const FIRMA_PDF = '%PDF-';
 
 /**
- * Marca del informe completo. El esqueleto se titula sólo "REPORTE DE
- * DESEMPEÑO"; el bueno lleva "EVALUACIÓN 360" en la portada.
+ * Rastro de la página de error de ASP.NET. Va en claro dentro del PDF, así que
+ * se busca sobre el binario sin más.
  */
-const MARCA_INFORME = /REPORTE\s+EVALUACI[ÓO]N\s*360/i;
-
-/** Rastro de la página de error de ASP.NET dentro del PDF. */
 const MARCA_ERROR = /Server Error in|Exception Details|does not belong to table/i;
+
+/**
+ * Páginas mínimas para considerar que un informe trae datos.
+ *
+ * Medido sobre los dos tipos de respuesta: el informe completo tiene entre 37 y
+ * 42 páginas; el esqueleto vacío, exactamente 10. El umbral va en medio y con
+ * holgura hacia los dos lados.
+ */
+const MINIMO_PAGINAS = 20;
 
 /** El servidor tarda entre uno y tres minutos en armar cada informe. */
 export const TIMEOUT_DESCARGA = 600_000;
 
 /**
- * ¿El PDF descargado es el informe completo?
+ * Cuenta las páginas de un PDF.
  *
- * Se mira dentro del binario en latin1: los flujos de un PDF van comprimidos,
- * pero el texto de la portada de éstos aparece en claro, y basta para
- * distinguir las tres cosas que puede devolver el servidor.
+ * `/Type /Page` aparece una vez por página más una por el nodo `/Type /Pages`
+ * que las agrupa, porque el primero es prefijo del segundo. Restando esa
+ * aparición se obtiene el número exacto: comprobado contra pdfinfo en los dos
+ * tipos de respuesta (43 marcas → 42 páginas, 11 → 10).
  *
- * @returns {{valido:boolean, motivo?:string}}
+ * Se cuenta a mano en vez de usar una librería porque es lo único que se
+ * necesita del formato, y porque estos PDF son 1.4: los objetos de página van
+ * sin comprimir y se pueden contar sobre el binario.
+ */
+export function contarPaginas(cuerpo) {
+  const texto = cuerpo.toString('latin1');
+  const todas = (texto.match(/\/Type\s*\/Pages?/g) ?? []).length;
+  const agrupadores = (texto.match(/\/Type\s*\/Pages/g) ?? []).length;
+  return todas - agrupadores;
+}
+
+/**
+ * ¿El PDF descargado es un informe con datos?
+ *
+ * Tres cosas distintas llegan con HTTP 200 y firma `%PDF-` válida:
+ *
+ *   1. el informe de verdad: 37 a 42 páginas, entre 200 KB y 900 KB;
+ *   2. un esqueleto de 10 páginas y ~110 KB, titulado sólo "REPORTE DE
+ *      DESEMPEÑO" y sin un dato dentro, que es lo que devuelve el servidor
+ *      cuando la sesión no tiene abierto el detalle de la evaluación;
+ *   3. la página de error de ASP.NET maquetada como PDF.
+ *
+ * Se distinguen por el número de páginas. Dos caminos que parecían más
+ * naturales no funcionan, y conviene dejarlo escrito para que nadie los repita:
+ *
+ * - Buscar el título en el binario NO sirve. El informe y el esqueleto comparten
+ *   la misma plantilla incrustada: los dos contienen "REPORTE", "360" y los
+ *   mismos identificadores de control.
+ * - Descomprimir los flujos tampoco basta. El texto de un PDF va troceado por
+ *   el ajuste entre caracteres —"REPORTE" puede quedar como `(R) 1 (EPORTE)`—
+ *   así que una búsqueda literal falla aunque el texto esté ahí.
+ *
+ * Que el informe corresponda a la persona pedida está garantizado por la URL,
+ * comprobado aparte: pedir el informe de una persona tras pulsar el botón de
+ * otra devuelve igualmente el de la primera.
+ *
+ * @param {Buffer} cuerpo
+ * @returns {{valido:boolean, paginas:number, motivo?:string}}
  */
 export function validarInforme(cuerpo) {
   if (cuerpo.subarray(0, FIRMA_PDF.length).toString('latin1') !== FIRMA_PDF) {
-    return { valido: false, motivo: 'la respuesta no es un PDF' };
+    return { valido: false, paginas: 0, motivo: 'la respuesta no es un PDF' };
   }
 
-  const texto = cuerpo.toString('latin1');
+  const paginas = contarPaginas(cuerpo);
 
-  if (MARCA_ERROR.test(texto)) {
-    return { valido: false, motivo: 'el PDF contiene una página de error de la aplicación' };
+  if (MARCA_ERROR.test(cuerpo.toString('latin1'))) {
+    return { valido: false, paginas, motivo: 'el PDF contiene una página de error de la aplicación' };
   }
-  if (!MARCA_INFORME.test(texto)) {
+
+  if (paginas < MINIMO_PAGINAS) {
     return {
       valido: false,
+      paginas,
       motivo:
-        'el PDF no es el informe completo (falta "REPORTE EVALUACIÓN 360"): ' +
-        'la sesión no tenía abierto el detalle de la evaluación',
+        `el informe trae sólo ${paginas} página(s), por debajo de las ${MINIMO_PAGINAS} ` +
+        'esperadas: es el esqueleto vacío, no el informe con datos',
     };
   }
-  return { valido: true };
+
+  return { valido: true, paginas };
 }
 
 /**
@@ -97,7 +144,7 @@ export async function descargarInforme(sesion, informe, destino, { intentos = 3 
 
     if (respuesta?.ok()) {
       const cuerpo = await respuesta.body();
-      const { valido, motivo } = validarInforme(cuerpo);
+      const { valido, motivo, paginas } = validarInforme(cuerpo);
 
       if (valido) {
         // El nombre sale del `id`, único por persona Y evaluación: así las N
@@ -120,13 +167,14 @@ export async function descargarInforme(sesion, informe, destino, { intentos = 3 
               claveEvaluacion: informe.claveEvaluacion,
               descargadoEn: new Date().toISOString(),
               bytes: cuerpo.length,
+              paginas,
             },
             null,
             2
           )
         );
 
-        return { ok: true, archivo, bytes: cuerpo.length };
+        return { ok: true, archivo, bytes: cuerpo.length, paginas };
       }
 
       ultimoFallo = motivo;
