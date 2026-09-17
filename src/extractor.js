@@ -11,7 +11,7 @@
  *    perfil de muestra tenía pobladas.
  * 3. GridViews — dos tablas HTML (cargos y vínculos familiares).
  */
-import { SEL, TIEMPOS, PREFIJOS_MODALES, CAMPOS_FORMULARIO_ALTA, PLACEHOLDERS, URLS } from './config.js';
+import { SEL, TIEMPOS, PREFIJOS_MODALES, CAMPOS_FORMULARIO_ALTA, PLACEHOLDERS, URLS, ESTADOS_LISTADO } from './config.js';
 
 /**
  * Pulsa los "Mostrar Más" hasta agotarlos.
@@ -163,21 +163,117 @@ export async function extraerHojaVida(sesion) {
 }
 
 /**
- * Flujo completo para una cédula: buscar, abrir, expandir y extraer.
+ * Pone el filtro de estado del listado en "Todos".
+ *
+ * Sin esto el grid sólo muestra a los vinculados y el resto —aspirantes,
+ * candidatos, desvinculados y bloqueados— se reporta como "sin resultados".
+ *
+ * Es idempotente: si el combo ya está en "Todos" no dispara el postback, que
+ * cuesta un par de segundos por documento.
+ *
+ * @returns {Promise<{cambiado:boolean, valor:string|null}>}
+ */
+export async function filtrarTodosLosEstados(sesion) {
+  const page = sesion.page;
+  const combo = page.locator(ESTADOS_LISTADO.selector);
+
+  if ((await combo.count()) === 0) {
+    // Si el combo no está, el listado no lo filtra: nada que hacer.
+    return { cambiado: false, valor: null };
+  }
+
+  const actual = await combo.inputValue();
+  if (actual === ESTADOS_LISTADO.todos) return { cambiado: false, valor: actual };
+
+  // Por value, no por texto: el rótulo es lo que cambia cuando la aplicación
+  // se traduce o se renombra una opción.
+  await combo.selectOption(ESTADOS_LISTADO.todos).catch(async (error) => {
+    await combo.selectOption({ label: ESTADOS_LISTADO.etiquetaTodos }).catch(() => {
+      throw error;
+    });
+  });
+  // El onchange del combo es un __doPostBack: el grid se rearma antes de que
+  // tenga sentido escribir en el buscador.
+  await sesion.esperarPostback();
+
+  return { cambiado: true, valor: await combo.inputValue() };
+}
+
+/**
+ * Deja el listado cargado y filtrado por "Todos", listo para buscar.
+ * @returns {Promise<{cambiado:boolean, valor:string|null}>}
+ */
+async function abrirListado(sesion) {
+  await sesion.page.goto(URLS.adultos, { waitUntil: 'domcontentloaded' });
+  await sesion.esperarPostback();
+  // El filtro va ANTES de escribir: su onchange es un postback que repinta el
+  // grid y limpiaría el buscador. Y cada goto lo devuelve a "Vinculado", así
+  // que hay que fijarlo en cada documento.
+  return filtrarTodosLosEstados(sesion);
+}
+
+/**
+ * Busca un documento en el listado y devuelve cuántas filas trajo.
+ *
+ * Leer el conteo justo después del postback no es fiable: una de cada diez
+ * búsquedas encuentra el grid todavía sin renderizar y devuelve cero, lo que
+ * el RPA interpretaba como "este documento no existe". Aquí se espera de forma
+ * activa a que aparezca al menos una fila, y si no aparece se repite la
+ * búsqueda desde el listado recargado antes de darla por vacía.
+ *
+ * El grid ausente es la única señal de "sin resultados" que da la aplicación:
+ * no pinta ningún mensaje, simplemente no renderiza la tabla. Por eso hace
+ * falta agotar el tiempo de espera para concluir que algo no está.
+ *
+ * @returns {Promise<{filas:number, intentos:number, filtro:{valor:string|null}}>}
+ */
+export async function buscarDocumento(sesion, documento, { intentos = 2 } = {}) {
+  const page = sesion.page;
+  let filtro = { cambiado: false, valor: null };
+
+  for (let intento = 1; intento <= intentos; intento++) {
+    // El primer intento reutiliza el listado que ya dejó abierto el llamador;
+    // los siguientes lo recargan, porque un grid que no pintó puede haberse
+    // llevado por delante el resto del UpdatePanel.
+    if (intento > 1) filtro = await abrirListado(sesion);
+
+    await page.fill(SEL.listado.buscar, documento);
+    await page.press(SEL.listado.buscar, 'Enter');
+    await sesion.esperarPostback();
+
+    const filas = await page
+      .waitForSelector(SEL.listado.filaSeleccionable, { timeout: TIEMPOS.esperaGridResultados })
+      .then(() => page.locator(SEL.listado.filaSeleccionable).count())
+      .catch(() => 0);
+
+    if (filas > 0) return { filas, intentos: intento, filtro };
+  }
+
+  return { filas: 0, intentos, filtro };
+}
+
+/**
+ * Flujo completo para una cédula: filtrar, buscar, abrir, expandir y extraer.
  * @returns {Promise<{encontrado:boolean, datos?:Object, expansiones?:Object}>}
  */
 export async function procesarDocumento(sesion, documento) {
   const page = sesion.page;
 
-  await page.goto(URLS.adultos, { waitUntil: 'domcontentloaded' });
-  await sesion.esperarPostback();
+  let filtro = await abrirListado(sesion);
+  const busqueda = await buscarDocumento(sesion, documento);
+  filtro = busqueda.filtro.valor ? busqueda.filtro : filtro;
+  const filas = busqueda.filas;
 
-  await page.fill(SEL.listado.buscar, documento);
-  await page.press(SEL.listado.buscar, 'Enter');
-  await sesion.esperarPostback();
-
-  const filas = await page.locator(SEL.listado.filaSeleccionable).count();
-  if (filas === 0) return { encontrado: false, motivo: 'sin resultados en el buscador' };
+  if (filas === 0) {
+    // Con el filtro en "Todos" y tras agotar los reintentos, un cero aquí sí
+    // significa que el documento no está en la aplicación.
+    return {
+      encontrado: false,
+      motivo:
+        `sin resultados en el buscador tras ${busqueda.intentos} intento(s) ` +
+        `(filtro de estados = ${filtro.valor ?? 'sin combo'})`,
+    };
+  }
 
   await page.locator(SEL.listado.filaSeleccionable).first().click();
   await sesion.esperarPostback();
@@ -197,5 +293,12 @@ export async function procesarDocumento(sesion, documento) {
     };
   }
 
-  return { encontrado: true, datos, expansiones, filasEncontradas: filas };
+  return {
+    encontrado: true,
+    datos,
+    expansiones,
+    filasEncontradas: filas,
+    filtroEstados: filtro.valor,
+    intentosBusqueda: busqueda.intentos,
+  };
 }

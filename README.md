@@ -57,6 +57,7 @@ node src/main.js --ayuda
 | `--headless` | Sin ventana. Es el valor por defecto. |
 | `--slow-mo <ms>` | Pausa entre acciones del navegador. Sólo para observar; no sustituye a la pausa entre perfiles. |
 | `--reintentar-errores` | Incluye los documentos en estado `error` además de los `pendiente`. |
+| `--reintentar-no-encontrados` | Incluye además los `no_encontrado`. Para usar tras corregir un fallo del RPA, cuando los negativos anteriores dejan de ser fiables. Manda sobre `--omitir-procesados`. |
 | `--omitir-procesados` | Salta los que ya fueron consultados (`ok` o `no_encontrado`). Hace idempotente también a `--solo`. |
 | `--sin-sembrar` | No relee el CSV. Útil cuando la colección ya está sembrada. |
 | `--ayuda` | Muestra la ayuda. |
@@ -96,6 +97,19 @@ node src/main.js --solo 52427771 --headed --slow-mo 400 --sin-sembrar
 ```bash
 node src/main.js --reintentar-errores --headless
 ```
+
+**Recuperar los marcados como sin ficha tras corregir el RPA.** Un
+`no_encontrado` de una corrida vieja no prueba que la persona no exista: puede
+venir de un filtro mal puesto o de una espera corta. Cuando se arregla algo del
+flujo de búsqueda, esos negativos hay que volver a preguntarlos:
+
+```bash
+node src/main.js --reintentar-no-encontrados --sin-sembrar --headless
+```
+
+Los que de verdad no estén cuestan ~19 s cada uno —agotan la espera del grid y
+el reintento— frente a los ~10 s de un perfil normal. Es el precio de no dar
+por inexistente a alguien que sí está.
 
 **Medir el rendimiento a un ritmo fijo,** sin que la rampa cambie el escalón a
 mitad de la medición:
@@ -154,8 +168,9 @@ db.perfiles.find({ "web.experienciaLaboral.0": { $exists: true } }).count()
    repetidas no son duplicados: describen cargos distintos de la misma persona,
    así que se acumulan en `csv.cargos`.
 2. Siembra MongoDB con esos documentos en estado `pendiente`.
-3. Por cada documento: busca la cédula, abre la ficha, pulsa los cuatro
-   "Mostrar Más" hasta agotarlos y extrae las once secciones.
+3. Por cada documento: pone el filtro de estados en **Todos**, busca la cédula,
+   abre la ficha, pulsa los cuatro "Mostrar Más" hasta agotarlos y extrae las
+   once secciones.
 4. Guarda el resultado y marca el estado.
 
 ### Rampa de concurrencia
@@ -188,6 +203,10 @@ node src/main.js --solo 52427771                       # lo reprocesa siempre
 `--omitir-procesados` considera consultados los estados `ok` y `no_encontrado`
 —la ficha se buscó y el resultado se conoce— pero no `error`, donde la consulta
 no llegó a completarse y reintentar sí tiene sentido.
+
+La excepción es `--reintentar-no-encontrados`: cuando se pide expresamente
+volver sobre los sin ficha, `--omitir-procesados` deja de contarlos como
+consultados. De lo contrario un flag anularía al otro en silencio.
 
 ## Estructura de la colección `perfiles`
 
@@ -245,3 +264,18 @@ guardar en cualquier sección, importar y "Entrar Como".
 - Las listas son Repeaters con ids del tipo
   `MainContent_<Repeater>_Lbl_<Campo>_<n>`. Se detectan por patrón, no por lista
   fija, para no perder secciones que no aparecían en los perfiles de muestra.
+- El listado **viene filtrado por estado "Vinculado"**. El combo
+  `MainContent_cbo_estados` llega preseleccionado en el value `2`, y hay que
+  ponerlo en `-1` ("Todos") antes de cada búsqueda para ver también a
+  aspirantes, candidatos, desvinculados y bloqueados. Su `onchange` es un
+  `__doPostBack` que repinta el grid y limpia el buscador: el orden es
+  **primero el filtro, después el término de búsqueda**. Cada `goto` al
+  listado devuelve el combo a su valor por defecto, así que se fija en cada
+  documento.
+- "Sin resultados" no tiene mensaje propio: la aplicación simplemente no
+  renderiza el grid. Y el grid tarda en pintar de forma irregular —medido: una
+  de cada diez búsquedas devuelve cero si se lee el conteo de inmediato—, así
+  que hay que esperar de forma activa a que aparezca una fila y reintentar la
+  búsqueda antes de concluir que un documento no está.
+- El buscador es sensible a los espacios: un `"1053860607 "` con espacio final
+  no devuelve nada.

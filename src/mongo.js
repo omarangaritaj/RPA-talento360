@@ -114,12 +114,23 @@ export async function sembrarDesdeCsv(personas) {
 
 /**
  * Documentos que aún hay que procesar.
- * @param {{limite?:number, reintentarErrores?:boolean}} opciones
+ *
+ * `no_encontrado` no se reintenta por defecto: en régimen normal significa que
+ * la ficha no está en la aplicación y volver sobre ella es tiempo perdido. Se
+ * incluye a petición, que es lo que hace falta cuando se corrige un fallo del
+ * propio RPA —un filtro mal puesto, una espera corta— y los negativos de
+ * corridas anteriores dejan de ser de fiar.
+ *
+ * @param {{limite?:number, reintentarErrores?:boolean, reintentarNoEncontrados?:boolean}} opciones
  */
-export async function pendientes({ limite = 0, reintentarErrores = false } = {}) {
-  const estados = reintentarErrores
-    ? [ESTADOS.pendiente, ESTADOS.error]
-    : [ESTADOS.pendiente];
+export async function pendientes({
+  limite = 0,
+  reintentarErrores = false,
+  reintentarNoEncontrados = false,
+} = {}) {
+  const estados = [ESTADOS.pendiente];
+  if (reintentarErrores) estados.push(ESTADOS.error);
+  if (reintentarNoEncontrados) estados.push(ESTADOS.noEncontrado);
 
   const consulta = Perfil.find({ estado: { $in: estados } }, { documento: 1, _id: 0 })
     .sort({ documento: 1 })
@@ -175,16 +186,22 @@ export const ESTADOS_CONSULTADOS = [ESTADOS.ok, ESTADOS.noEncontrado];
  * Hace idempotente cualquier modo de ejecución, incluido `--solo`, que por
  * diseño ignora el estado para permitir reprocesar a propósito.
  *
+ * `incluirNoEncontrados` deja fuera del filtro a los marcados como sin ficha,
+ * para que pedir expresamente reprocesarlos no quede anulado por el omitidor.
+ *
  * @param {string[]} documentos
+ * @param {{incluirNoEncontrados?:boolean}} opciones
  * @returns {Promise<{procesar:string[], omitidos:string[]}>}
  */
-export async function separarYaConsultados(documentos) {
+export async function separarYaConsultados(documentos, { incluirNoEncontrados = false } = {}) {
   if (!documentos.length) return { procesar: [], omitidos: [] };
+
+  const estados = incluirNoEncontrados ? [ESTADOS.ok] : ESTADOS_CONSULTADOS;
 
   const consultados = new Set(
     (
       await Perfil.find(
-        { documento: { $in: documentos }, estado: { $in: ESTADOS_CONSULTADOS } },
+        { documento: { $in: documentos }, estado: { $in: estados } },
         { documento: 1, _id: 0 }
       ).lean()
     ).map((p) => p.documento)

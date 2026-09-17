@@ -30,6 +30,8 @@ export const SEL = {
   },
   listado: {
     buscar: '#MainContent_txtBuscar',
+    // Filtro por estado del registro. Arranca en "Vinculado": ver ESTADOS_LISTADO.
+    estados: '#MainContent_cbo_estados',
     grid: '#MainContent_gv_GestionHojaVida',
     filaSeleccionable: '#MainContent_gv_GestionHojaVida tr[onclick]',
     editar: '#MainContent_btnEditar',
@@ -46,6 +48,27 @@ export const SEL = {
     { seccion: 'experienciaLaboral', selector: '#MainContent_Btn_ExpLaboralMosMas' },
     { seccion: 'idiomas', selector: '#MainContent_Btn_IdiomasMosMas' },
   ],
+};
+
+/**
+ * Filtro de estado del listado de hojas de vida.
+ *
+ * El combo `MainContent_cbo_estados` NO arranca en "Todos": el servidor lo
+ * entrega preseleccionado en "Vinculado" (value 2). Buscar sin tocarlo deja
+ * fuera a aspirantes, candidatos, desvinculados y bloqueados, y el RPA los
+ * marcaba como "no encontrado" aunque su hoja de vida existiera.
+ *
+ * El combo lleva `onchange="__doPostBack(...)"`, así que cambiarlo recarga el
+ * grid por postback parcial y limpia el buscador: hay que fijar el estado
+ * ANTES de escribir el documento, nunca después.
+ */
+export const ESTADOS_LISTADO = {
+  selector: '#MainContent_cbo_estados',
+  /** value de la opción "Todos". El texto se usa sólo como respaldo. */
+  todos: '-1',
+  etiquetaTodos: 'Todos',
+  /** Preselección del servidor, la que causaba los falsos "no encontrado". */
+  predeterminado: '2',
 };
 
 /**
@@ -109,6 +132,14 @@ export const TIEMPOS = {
   timeoutAccion: 120_000,
   esperaPostback: 12_000,
   pausaTrasPostback: 400,
+  /**
+   * Espera activa a que el grid del listado pinte resultados tras buscar.
+   * El postback responde en ~600ms, pero una de cada diez búsquedas deja el
+   * grid sin renderizar durante un instante: leer el conteo de inmediato daba
+   * cero y el documento se marcaba como inexistente. Sólo se agota el tiempo
+   * completo cuando el documento de verdad no está.
+   */
+  esperaGridResultados: 8_000,
   maxClicsMostrarMas: 40,
 };
 
