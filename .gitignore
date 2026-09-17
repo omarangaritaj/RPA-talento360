@@ -1,2 +1,6 @@
 .env
 HojaVidaSiscout.csv
+node_modules/
+datos/
+capturas/
+*.log
