@@ -61,6 +61,93 @@ node src/main.js --ayuda
 | `--sin-sembrar` | No relee el CSV. Útil cuando la colección ya está sembrada. |
 | `--ayuda` | Muestra la ayuda. |
 
+### Atajos de npm
+
+| Comando | Equivale a |
+|---------|-----------|
+| `npm run prueba` | `node src/main.js --limite 10 --headed --workers 1` |
+| `npm start` | `node src/main.js` |
+| `npm run produccion` | `node src/main.js --headless` |
+
+### Recetas
+
+**Validar antes de una corrida larga.** Sesenta perfiles bastan para ver subir
+el primer escalón de la rampa, que necesita 50 éxitos seguidos:
+
+```bash
+node src/main.js --limite 60 --headless
+```
+
+**La corrida completa.** Se puede cortar con Ctrl+C en cualquier momento: el
+estado se guarda perfil a perfil, así que al relanzarla sigue donde quedó.
+
+```bash
+node src/main.js --headless
+```
+
+**Depurar un perfil concreto.** Con ventana, lento y sin releer el CSV:
+
+```bash
+node src/main.js --solo 52427771 --headed --slow-mo 400 --sin-sembrar
+```
+
+**Barrer los fallidos al día siguiente:**
+
+```bash
+node src/main.js --reintentar-errores --headless
+```
+
+**Medir el rendimiento a un ritmo fijo,** sin que la rampa cambie el escalón a
+mitad de la medición:
+
+```bash
+node src/main.js --limite 100 --workers 2 --headless
+```
+
+### Cuánto tarda
+
+Un perfil cuesta unos 10 s: búsqueda, apertura de la ficha, cuatro expansiones
+y vuelta al listado. Sobre 2.971 documentos:
+
+| Concurrencia | Duración aproximada |
+|--------------|---------------------|
+| 1 worker | ~10 h |
+| 2 workers | ~5 h |
+| 3 workers | ~3,5 h |
+
+La rampa recorre esos escalones sola, así que una corrida completa que empieza
+en 1 worker termina antes de las 10 h si el servidor lo tolera.
+
+## Consultar los resultados
+
+```js
+// resumen por estado
+db.perfiles.aggregate([{ $group: { _id: "$estado", total: { $sum: 1 } } }])
+
+// un perfil completo
+db.perfiles.findOne({ documento: "52427771" })
+
+// los que fallaron y por qué
+db.perfiles.find({ estado: "error" }, { documento: 1, ultimoError: 1, intentos: 1 })
+
+// cédulas que no existen en la aplicación
+db.perfiles.find({ estado: "no_encontrado" }, { documento: 1, motivo: 1 })
+
+// perfiles con experiencia laboral registrada
+db.perfiles.find({ "web.experienciaLaboral.0": { $exists: true } }).count()
+```
+
+## Si algo sale mal
+
+| Síntoma | Causa y salida |
+|---------|----------------|
+| `Login rechazado para "..."` | Usuario o clave incorrectos en `.env`. Si el usuario que aparece es el de tu sesión de Linux, falta `USER_1` y está cayendo al `USER` del sistema. |
+| `AVISO: hay N credenciales pero sólo 1 cuenta distinta` | Repetiste la misma cuenta en `USER_1..USER_N`. Se usará una sola; la rampa no pasará de un worker. |
+| `Falta MONGO_URI en .env` | No hay URI de Mongo. |
+| Muchos errores seguidos | La rampa baja de escalón sola. Si persisten, corta y relanza más tarde: lo hecho está guardado. |
+| `sesión caída, reautenticando…` | Normal en corridas largas: el servidor caduca la sesión y el worker vuelve a entrar solo. |
+| `ATENCIÓN: el guard bloqueó N intento(s) de escritura` | Un selector apuntó a un control que modifica datos. **No debería ocurrir nunca**: revísalo antes de seguir. |
+
 ## Cómo trabaja
 
 1. Lee el CSV y agrupa las 3.688 filas en 2.971 documentos únicos. Las filas
