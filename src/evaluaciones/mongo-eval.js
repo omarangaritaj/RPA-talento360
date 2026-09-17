@@ -1,0 +1,218 @@
+/**
+ * Persistencia de las evaluaciones de desempeño.
+ *
+ * Igual que `perfiles` en la etapa 1, la colección hace de checkpoint además de
+ * destino: cada evaluación guarda su estado, y una corrida interrumpida se
+ * reanuda preguntando qué falta. Con ~980 evaluaciones a ~20s cada una, poder
+ * reanudar no es comodidad.
+ *
+ * Los evaluados van EMBEBIDOS y no en su propia colección. La razón es que
+ * nunca se consultan sueltos: siempre se leen en el contexto de su evaluación,
+ * el documento entero cabe de sobra en los 16 MB de Mongo, y así una evaluación
+ * se escribe o se descarta de una sola pieza.
+ */
+import mongoose from 'mongoose';
+import { createHash } from 'node:crypto';
+
+export const ESTADOS_EVAL = {
+  pendiente: 'pendiente',
+  ok: 'ok',
+  vacia: 'vacia',
+  error: 'error',
+};
+
+export const ESTADOS_INFORME = {
+  pendiente: 'pendiente',
+  descargado: 'descargado',
+  error: 'error',
+  sinUrl: 'sin_url',
+};
+
+const evaluadorSchema = new mongoose.Schema(
+  {
+    /** autoevaluacion | jefe | par | subalterno, según el icono de la fila. */
+    relacion: String,
+    /** La clase del icono tal cual venía: preserva relaciones que no conozcamos. */
+    iconoCrudo: String,
+    nombre: String,
+    cargo: String,
+    /** Finalizada | Iniciada | Pendiente */
+    estado: String,
+    documento: String,
+    matchPor: String,
+    candidatos: [String],
+  },
+  { _id: false }
+);
+
+const informeSchema = new mongoose.Schema(
+  {
+    url: String,
+    /**
+     * Llave única del informe. `cargo` identifica el puesto y lo comparten
+     * personas distintas; `id` no se repite y es lo que nombra el archivo.
+     */
+    id: String,
+    group: String,
+    cargo: String,
+    estado: { type: String, enum: Object.values(ESTADOS_INFORME), default: ESTADOS_INFORME.pendiente },
+    archivo: String,
+    bytes: Number,
+    descargadoEn: Date,
+    intentos: { type: Number, default: 0 },
+    ultimoError: String,
+  },
+  { _id: false }
+);
+
+const evaluadoSchema = new mongoose.Schema(
+  {
+    /**
+     * Índice del botón imgBtn_Informe_Persona_N. Se renumera desde cero en cada
+     * página de la grilla, así que por sí solo no identifica al evaluado: hay
+     * que leerlo junto a `paginaPersonas`.
+     */
+    indice: Number,
+    /** Página de la grilla de personas donde apareció (pagina cada 10). */
+    paginaPersonas: Number,
+    nombre: String,
+    cargo: String,
+    email: String,
+    area: String,
+    documento: String,
+    /** email | nombre | nombre_via_evaluado | ambiguo_* | sin_match */
+    matchPor: String,
+    candidatos: [String],
+    evaluadores: [evaluadorSchema],
+    informe: informeSchema,
+  },
+  { _id: false }
+);
+
+const evaluacionSchema = new mongoose.Schema(
+  {
+    claveEvaluacion: { type: String, required: true, unique: true, index: true },
+    nivel: String,
+    region: String,
+    grupo: String,
+    fecha: String,
+    medicion: String,
+    estadoEval: String,
+    progreso: { completadas: Number, total: Number, crudo: String },
+
+    paginaOrigen: Number,
+    indiceSelect: Number,
+    /** Páginas que hubo que recorrer dentro de la grilla de personas. */
+    paginasPersonas: Number,
+
+    evaluados: [evaluadoSchema],
+
+    estado: {
+      type: String,
+      enum: Object.values(ESTADOS_EVAL),
+      default: ESTADOS_EVAL.pendiente,
+      index: true,
+    },
+    intentos: { type: Number, default: 0 },
+    ultimoError: String,
+    motivo: String,
+    extraidaEn: Date,
+    duracionMs: Number,
+    /** Conteo de evaluados leídos frente al total que declaraba el listado. */
+    verificacion: mongoose.Schema.Types.Mixed,
+  },
+  { timestamps: true, collection: 'evaluaciones', strict: true, minimize: false }
+);
+
+export const Evaluacion = mongoose.model('Evaluacion', evaluacionSchema);
+
+/**
+ * Identidad de negocio de una evaluación.
+ *
+ * No se usa la posición en la grilla: basta con que alguien cree una evaluación
+ * nueva para que todas las de abajo se corran de página y las claves dejen de
+ * coincidir con lo ya guardado. Nivel, región, grupo, fecha y medición sí
+ * identifican a la evaluación con independencia de dónde caiga en el listado.
+ */
+export function claveDeEvaluacion(fila) {
+  const partes = [fila.nivel, fila.region, fila.grupo, fila.fecha, fila.medicion]
+    .map((p) => (p ?? '').trim().toUpperCase())
+    .join('|');
+  return createHash('sha1').update(partes).digest('hex').slice(0, 16);
+}
+
+export async function sincronizarIndices() {
+  await Evaluacion.syncIndexes();
+}
+
+/** Claves ya procesadas con éxito, para saltarlas al reanudar. */
+export async function clavesProcesadas() {
+  const hechas = await Evaluacion.find(
+    { estado: { $in: [ESTADOS_EVAL.ok, ESTADOS_EVAL.vacia] } },
+    { claveEvaluacion: 1, _id: 0 }
+  ).lean();
+  return new Set(hechas.map((e) => e.claveEvaluacion));
+}
+
+/** Guarda una evaluación extraída con éxito. Reescribe: la última lectura manda. */
+export function guardarEvaluacion(clave, datos) {
+  return Evaluacion.updateOne(
+    { claveEvaluacion: clave },
+    {
+      $set: {
+        ...datos,
+        estado: ESTADOS_EVAL.ok,
+        extraidaEn: new Date(),
+        ultimoError: null,
+        motivo: null,
+      },
+      $inc: { intentos: 1 },
+    },
+    { upsert: true }
+  );
+}
+
+/** Registra una evaluación sin personas o con fallo. */
+export function guardarFalloEvaluacion(clave, fila, { estado, mensaje, paginaOrigen }) {
+  return Evaluacion.updateOne(
+    { claveEvaluacion: clave },
+    {
+      $set: {
+        ...fila,
+        paginaOrigen,
+        estado,
+        ...(estado === ESTADOS_EVAL.error ? { ultimoError: mensaje } : { motivo: mensaje }),
+      },
+      $inc: { intentos: 1 },
+    },
+    { upsert: true }
+  );
+}
+
+/** Conteos para el informe final. */
+export async function resumenEvaluaciones() {
+  const [porEstado] = await Promise.all([
+    Evaluacion.aggregate([{ $group: { _id: '$estado', total: { $sum: 1 } } }]),
+  ]);
+
+  const [totales] = await Evaluacion.aggregate([
+    { $unwind: { path: '$evaluados', preserveNullAndEmptyArrays: false } },
+    {
+      $group: {
+        _id: null,
+        evaluados: { $sum: 1 },
+        conDocumento: { $sum: { $cond: [{ $ifNull: ['$evaluados.documento', false] }, 1, 0] } },
+        conUrl: { $sum: { $cond: [{ $ifNull: ['$evaluados.informe.url', false] }, 1, 0] } },
+        evaluadores: { $sum: { $size: { $ifNull: ['$evaluados.evaluadores', []] } } },
+      },
+    },
+  ]);
+
+  return {
+    porEstado: Object.fromEntries(porEstado.map((f) => [f._id, f.total])),
+    evaluados: totales?.evaluados ?? 0,
+    evaluadosConCedula: totales?.conDocumento ?? 0,
+    evaluadosConUrlInforme: totales?.conUrl ?? 0,
+    evaluadores: totales?.evaluadores ?? 0,
+  };
+}
