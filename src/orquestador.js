@@ -26,8 +26,16 @@ const log = (mensaje) => console.log(`[${new Date().toLocaleTimeString('es-CO')}
  * fallos seguidos.
  */
 class Rampa {
-  constructor(maxWorkers) {
-    this.escalon = 0;
+  /**
+   * @param {number} maxWorkers credenciales disponibles
+   * @param {number} [fijo] si se indica, la concurrencia queda clavada ahí y
+   *   la rampa deja de subir y bajar. Útil para medir a un ritmo concreto.
+   */
+  constructor(maxWorkers, fijo) {
+    this.fijo = fijo ? Math.min(fijo, maxWorkers) : null;
+    this.escalon = this.fijo
+      ? Math.max(0, RAMPA.escalones.findIndex((e) => e.workers >= this.fijo))
+      : 0;
     this.maxEscalon = Math.min(RAMPA.escalones.length, maxWorkers) - 1;
     this.exitosSeguidos = 0;
     this.erroresSeguidos = 0;
@@ -38,10 +46,12 @@ class Rampa {
   }
 
   get workers() {
+    if (this.fijo) return this.fijo;
     return Math.min(this.actual.workers, this.maxEscalon + 1);
   }
 
   registrarExito() {
+    if (this.fijo) return false;
     this.exitosSeguidos++;
     this.erroresSeguidos = 0;
     if (this.exitosSeguidos >= RAMPA.exitosParaSubir && this.escalon < this.maxEscalon) {
@@ -54,6 +64,7 @@ class Rampa {
   }
 
   registrarError() {
+    if (this.fijo) return false;
     this.erroresSeguidos++;
     this.exitosSeguidos = 0;
     if (this.erroresSeguidos >= RAMPA.erroresParaBajar && this.escalon > 0) {
@@ -135,7 +146,8 @@ async function procesarConReintentos(sesion, documento, contadores) {
  */
 export async function ejecutar(documentos, credenciales, opciones = {}) {
   const cola = new Cola(documentos);
-  const rampa = new Rampa(credenciales.length);
+  const rampa = new Rampa(credenciales.length, opciones.workers);
+  if (rampa.fijo) log(`Concurrencia fija en ${rampa.fijo} worker(s): la rampa queda desactivada.`);
   const contadores = { ok: 0, errores: 0, noEncontrados: 0 };
   const inicio = Date.now();
 

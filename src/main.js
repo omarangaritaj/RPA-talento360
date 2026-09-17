@@ -22,6 +22,7 @@ function leerArgumentos(argv) {
     reintentarErrores: false,
     solo: [],
     sembrar: true,
+    workers: 0,
   };
 
   for (let i = 2; i < argv.length; i++) {
@@ -29,6 +30,7 @@ function leerArgumentos(argv) {
     const valor = () => argv[++i];
 
     if (arg === '--limite') opciones.limite = Number(valor());
+    else if (arg === '--workers') opciones.workers = Number(valor());
     else if (arg === '--headed') { opciones.headless = false; opciones.slowMo ||= 250; }
     else if (arg === '--headless') opciones.headless = true;
     else if (arg === '--slow-mo') opciones.slowMo = Number(valor());
@@ -46,6 +48,7 @@ RPA talento360 — extracción de hojas de vida a MongoDB
 
   --limite <n>            procesa sólo n documentos (lote de prueba)
   --solo <doc1,doc2>      procesa únicamente esos documentos
+  --workers <n>           fija la concurrencia en n y desactiva la rampa
   --headed                abre el navegador con ventana visible
   --headless              sin ventana (por defecto)
   --slow-mo <ms>          ralentiza cada acción, útil para observar
@@ -86,6 +89,7 @@ async function principal() {
   const total = await ejecutar(documentos, credenciales, {
     headless: opciones.headless,
     slowMo: opciones.slowMo,
+    workers: opciones.workers,
   });
 
   const minutos = (total.duracionMs / 60000).toFixed(1);

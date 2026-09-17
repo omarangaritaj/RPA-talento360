@@ -37,12 +37,27 @@ sí. Si repites cuentas, el programa lo detecta, avisa y usa una sola por cuenta
 npm install
 npx playwright install chromium
 
-npm run prueba                      # 10 perfiles, con ventana visible
-node src/main.js                    # corrida completa
+npm run prueba                      # 10 perfiles, con ventana y 1 worker
+node src/main.js                    # corrida completa, con rampa
 node src/main.js --reintentar-errores
 node src/main.js --solo 52427771,94501035
+node src/main.js --workers 2        # concurrencia fija, sin rampa
 node src/main.js --ayuda
 ```
+
+### Opciones
+
+| Opción | Qué hace |
+|--------|----------|
+| `--limite <n>` | Toma sólo los primeros `n` pendientes. Para lotes de prueba. |
+| `--solo <docs>` | Procesa exactamente esos documentos, separados por coma. Ignora el estado que tengan. |
+| `--workers <n>` | Fija la concurrencia en `n` y desactiva la rampa. Topeado por el número de cuentas disponibles. |
+| `--headed` | Abre el navegador con ventana. Implica `--slow-mo 250` si no se indica otro valor. |
+| `--headless` | Sin ventana. Es el valor por defecto. |
+| `--slow-mo <ms>` | Pausa entre acciones del navegador. Sólo para observar; no sustituye a la pausa entre perfiles. |
+| `--reintentar-errores` | Incluye los documentos en estado `error` además de los `pendiente`. |
+| `--sin-sembrar` | No relee el CSV. Útil cuando la colección ya está sembrada. |
+| `--ayuda` | Muestra la ayuda. |
 
 ## Cómo trabaja
 
