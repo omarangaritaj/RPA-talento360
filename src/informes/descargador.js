@@ -1,148 +1,143 @@
 /**
  * Descarga de los informes PDF (etapa 2, fase 2).
  *
- * La fase 1 dejó en Mongo la URL de cada informe. Descargarlos es un GET normal
- * que sólo necesita la cookie de sesión, así que aquí no hace falta navegar
- * por la aplicación: se abre una sesión, se piden los archivos y se guardan.
+ * La lección que da forma a este módulo: **la URL no basta**.
  *
- * Lo que sí condiciona el diseño es el tiempo. El servidor GENERA el PDF en el
- * momento de la petición y tarda entre dos y cuatro minutos —medido: 872 KB en
- * 239 s—, y mientras tanto ASP.NET mantiene tomado el lock de esa sesión. Dos
- * descargas simultáneas sobre la misma sesión no van en paralelo: hacen cola.
+ * Un GET a `informe_Desemp.aspx?id=…&group=…&cargo=…` con una cookie válida
+ * responde HTTP 200 y devuelve un PDF perfectamente formado… de 110 KB,
+ * titulado "REPORTE DE DESEMPEÑO" y sin un solo dato de la persona. El informe
+ * de verdad pesa entre 200 KB y 900 KB, se titula "REPORTE EVALUACIÓN 360 DE
+ * DESEMPEÑO" y lleva el nombre en la portada.
  *
- * Por eso el paralelismo se consigue con VARIAS SESIONES, no con varias
- * peticiones. Cada worker abre su propio contexto de navegador y hace su propio
- * login, de modo que recibe una cookie distinta y, con ella, un lock distinto.
- * Funciona incluso con una sola credencial, porque lo que el servidor serializa
- * es la sesión, no la cuenta.
+ * La diferencia está en el estado de la sesión: el servidor sólo arma el
+ * informe completo si esa sesión tiene ABIERTO EL DETALLE de la evaluación. Por
+ * eso aquí no se descarga desde una sesión limpia: se recorre el listado, se
+ * abre la evaluación y sólo entonces se piden los informes de su gente.
+ *
+ * Se comprobó además, pidiendo el informe de una persona tras pulsar el botón
+ * de otra, que la URL sí manda sobre quién sale en el informe. Lo que la sesión
+ * aporta es el contexto de la evaluación, no la identidad de la persona.
+ *
+ * Y una advertencia sobre la validación: comprobar la firma `%PDF-` NO alcanza.
+ * Tanto el esqueleto vacío como la página de error de ASP.NET —que aparece como
+ * `Column 'Promedio' does not belong to table`— llegan como PDF válidos. Doce
+ * archivos se dieron por buenos antes de detectarlo.
  */
 import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { chromium } from 'playwright';
-import { URLS, SEL } from '../config.js';
-import { URL_EVALUACIONES } from '../evaluaciones/config-eval.js';
 
-/** Un PDF de verdad empieza por esta firma. Cualquier otra cosa es una página de error. */
+/** Un PDF de verdad empieza por esta firma. */
 const FIRMA_PDF = '%PDF-';
 
-/** El servidor puede tardar minutos en generar el informe. */
+/**
+ * Marca del informe completo. El esqueleto se titula sólo "REPORTE DE
+ * DESEMPEÑO"; el bueno lleva "EVALUACIÓN 360" en la portada.
+ */
+const MARCA_INFORME = /REPORTE\s+EVALUACI[ÓO]N\s*360/i;
+
+/** Rastro de la página de error de ASP.NET dentro del PDF. */
+const MARCA_ERROR = /Server Error in|Exception Details|does not belong to table/i;
+
+/** El servidor tarda entre uno y tres minutos en armar cada informe. */
 export const TIMEOUT_DESCARGA = 600_000;
 
 /**
- * Abre N sesiones independientes en un mismo navegador.
+ * ¿El PDF descargado es el informe completo?
  *
- * Un contexto por worker: cookies separadas, sesiones separadas del lado del
- * servidor. Comparten proceso de Chromium, que es lo barato de compartir.
+ * Se mira dentro del binario en latin1: los flujos de un PDF van comprimidos,
+ * pero el texto de la portada de éstos aparece en claro, y basta para
+ * distinguir las tres cosas que puede devolver el servidor.
  *
- * @returns {Promise<{navegador:Object, sesiones:Array<{etiqueta:string, request:Object}>}>}
+ * @returns {{valido:boolean, motivo?:string}}
  */
-export async function abrirSesiones(credencial, cantidad, { headless = true } = {}) {
-  const navegador = await chromium.launch({
-    headless,
-    args: ['--disable-blink-features=AutomationControlled'],
-  });
-
-  const sesiones = [];
-  for (let i = 1; i <= cantidad; i++) {
-    const contexto = await navegador.newContext();
-    const pagina = await contexto.newPage();
-
-    await pagina.goto(URLS.login, { waitUntil: 'domcontentloaded' });
-    await pagina.fill(SEL.login.usuario, credencial.usuario);
-    await pagina.fill(SEL.login.password, credencial.password);
-    await Promise.all([
-      pagina.waitForLoadState('domcontentloaded'),
-      pagina.click(SEL.login.enviar),
-    ]);
-
-    // El login fallido no avisa: devuelve al formulario.
-    if (pagina.url().includes('inicio.aspx')) {
-      await navegador.close().catch(() => {});
-      throw new Error(`Login rechazado para "${credencial.usuario}" al abrir la sesión ${i}`);
-    }
-
-    // Visita obligada al listado de evaluaciones antes de pedir ningún informe.
-    //
-    // No es una precaución: `informe_Desemp.aspx` responde HTTP 500 a una sesión
-    // recién autenticada que no haya pasado por aquí. Se midió: con sólo el
-    // login devuelve 500 en 74 s; tras visitar esta página, el mismo informe
-    // llega en 3 s. Bastan la visita al listado —no hace falta abrir el detalle
-    // de ninguna evaluación— porque lo que el informe necesita es el estado que
-    // la página deja en la sesión del servidor.
-    await pagina.goto(URL_EVALUACIONES, { waitUntil: 'domcontentloaded' });
-    await pagina.waitForTimeout(1500);
-
-    // La página ya no hace falta: sólo queríamos la cookie y el estado.
-    await pagina.close().catch(() => {});
-    sesiones.push({ etiqueta: `descarga-${i}`, request: contexto.request, contexto });
+export function validarInforme(cuerpo) {
+  if (cuerpo.subarray(0, FIRMA_PDF.length).toString('latin1') !== FIRMA_PDF) {
+    return { valido: false, motivo: 'la respuesta no es un PDF' };
   }
 
-  return { navegador, sesiones };
+  const texto = cuerpo.toString('latin1');
+
+  if (MARCA_ERROR.test(texto)) {
+    return { valido: false, motivo: 'el PDF contiene una página de error de la aplicación' };
+  }
+  if (!MARCA_INFORME.test(texto)) {
+    return {
+      valido: false,
+      motivo:
+        'el PDF no es el informe completo (falta "REPORTE EVALUACIÓN 360"): ' +
+        'la sesión no tenía abierto el detalle de la evaluación',
+    };
+  }
+  return { valido: true };
 }
 
 /**
- * Descarga un informe y lo guarda en disco.
+ * Pide un informe y lo guarda si es el bueno.
  *
- * Se verifica la firma del archivo antes de darlo por bueno: cuando la sesión
- * caduca, el servidor responde 200 con el HTML del login, y guardar eso como
- * PDF dejaría miles de archivos corruptos que nadie detectaría hasta la etapa
- * 3. El cuerpo que no es PDF se conserva aparte para poder diagnosticarlo.
+ * El 500 de esta página suele ser transitorio: aparece al pedir un informe
+ * mientras el servidor sigue ocupado con el anterior de la misma sesión. Se
+ * comprobó con un informe que devolvió 500 y bajó sin problema al reintentar,
+ * así que se reintenta con pausa creciente en vez de darlo por perdido.
  *
- * @param {{url:string, id:string}} informe
- * @param {string} destino carpeta donde guardar
+ * @param {{request:Object}} sesion
+ * @param {{url:string, id:string, nombre?:string, documento?:string}} informe
+ * @param {string} destino carpeta de salida
  * @returns {Promise<{ok:boolean, archivo?:string, bytes?:number, motivo?:string}>}
  */
-export async function descargarInforme(sesion, informe, destino) {
-  let respuesta;
-  try {
-    respuesta = await sesion.request.get(informe.url, { timeout: TIMEOUT_DESCARGA });
-  } catch (error) {
-    return { ok: false, motivo: `petición fallida: ${error.message}` };
+export async function descargarInforme(sesion, informe, destino, { intentos = 3 } = {}) {
+  let ultimoFallo = 'sin intento';
+
+  for (let intento = 1; intento <= intentos; intento++) {
+    let respuesta = null;
+    try {
+      respuesta = await sesion.request.get(informe.url, { timeout: TIMEOUT_DESCARGA });
+    } catch (error) {
+      ultimoFallo = `petición fallida: ${error.message}`;
+    }
+
+    if (respuesta?.ok()) {
+      const cuerpo = await respuesta.body();
+      const { valido, motivo } = validarInforme(cuerpo);
+
+      if (valido) {
+        // El nombre sale del `id`, único por persona Y evaluación: así las N
+        // evaluaciones de una misma persona nunca se pisan.
+        const archivo = join(destino, `${informe.id}.pdf`);
+        await mkdir(dirname(archivo), { recursive: true });
+        await writeFile(archivo, cuerpo);
+
+        // Un hermano con los datos de quién es: el PDF por sí solo no lo dice.
+        await writeFile(
+          join(destino, `${informe.id}.json`),
+          JSON.stringify(
+            {
+              id: informe.id,
+              url: informe.url,
+              nombre: informe.nombre,
+              documento: informe.documento,
+              evaluacion: informe.medicion,
+              grupo: informe.grupo,
+              claveEvaluacion: informe.claveEvaluacion,
+              descargadoEn: new Date().toISOString(),
+              bytes: cuerpo.length,
+            },
+            null,
+            2
+          )
+        );
+
+        return { ok: true, archivo, bytes: cuerpo.length };
+      }
+
+      ultimoFallo = motivo;
+      // Un PDF inválido no mejora reintentando: o falta estado de sesión, o la
+      // evaluación no tiene datos suficientes para armar el informe.
+      return { ok: false, motivo: ultimoFallo };
+    }
+
+    if (respuesta) ultimoFallo = `HTTP ${respuesta.status()}`;
+    if (intento < intentos) await new Promise((r) => setTimeout(r, 5000 * intento));
   }
 
-  if (!respuesta.ok()) {
-    return { ok: false, motivo: `HTTP ${respuesta.status()}` };
-  }
-
-  const cuerpo = await respuesta.body();
-
-  if (cuerpo.subarray(0, FIRMA_PDF.length).toString('latin1') !== FIRMA_PDF) {
-    const tipo = respuesta.headers()['content-type'] ?? 'desconocido';
-    const sospecha = cuerpo.toString('latin1', 0, 2000).includes('Txt_Usuario')
-      ? ' (parece la página de login: la sesión caducó)'
-      : '';
-    // Se guarda la respuesta para poder mirarla, pero no como .pdf.
-    const fallido = join(destino, `${informe.id}.no-es-pdf.html`);
-    await mkdir(dirname(fallido), { recursive: true });
-    await writeFile(fallido, cuerpo);
-    return { ok: false, motivo: `la respuesta no es un PDF (${tipo}, ${cuerpo.length} b)${sospecha}` };
-  }
-
-  // El nombre sale del `id` del informe, que es único por persona y evaluación.
-  // Así las N evaluaciones de una misma persona nunca se pisan.
-  const archivo = join(destino, `${informe.id}.pdf`);
-  await mkdir(dirname(archivo), { recursive: true });
-  await writeFile(archivo, cuerpo);
-
-  // Un hermano con los datos de quién es: el PDF por sí solo no lo dice.
-  await writeFile(
-    join(destino, `${informe.id}.json`),
-    JSON.stringify(
-      {
-        id: informe.id,
-        url: informe.url,
-        nombre: informe.nombre,
-        documento: informe.documento,
-        evaluacion: informe.medicion,
-        grupo: informe.grupo,
-        claveEvaluacion: informe.claveEvaluacion,
-        descargadoEn: new Date().toISOString(),
-        bytes: cuerpo.length,
-      },
-      null,
-      2
-    )
-  );
-
-  return { ok: true, archivo, bytes: cuerpo.length };
+  return { ok: false, motivo: `${ultimoFallo} tras ${intentos} intento(s)` };
 }

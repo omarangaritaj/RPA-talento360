@@ -121,6 +121,17 @@ export class SesionEvaluaciones extends Sesion {
   }
 
   /**
+   * Cliente HTTP que comparte cookies y estado con esta sesión.
+   *
+   * Es lo que permite pedir el PDF de un informe sin abrir una pestaña: el
+   * servidor sólo arma el informe completo si la petición llega con la sesión
+   * que tiene abierto el detalle de la evaluación.
+   */
+  get request() {
+    return this.page.context().request;
+  }
+
+  /**
    * Comprueba que la intercepción está viva en el documento actual.
    * Si un postback reemplazara el `window.open` nativo, la cosecha empezaría a
    * abrir pestañas y a bloquear la sesión sin avisar: mejor detectarlo.

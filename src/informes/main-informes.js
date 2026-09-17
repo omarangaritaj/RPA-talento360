@@ -2,53 +2,70 @@
 /**
  * Etapa 2, fase 2: descarga de los informes PDF.
  *
- *   node src/informes/main-informes.js --limite 5          # prueba corta
- *   node src/informes/main-informes.js --sesiones 6        # corrida larga
+ *   node src/informes/main-informes.js --limite-eval 2 --headed   # prueba
+ *   node src/informes/main-informes.js --sesiones 4               # corrida larga
  *   node src/informes/main-informes.js --reintentar-errores
  *
- * Lee de Mongo los informes con URL y estado pendiente y los baja a disco. Es
- * reanudable por construcción: cada archivo se marca en cuanto se guarda, así
- * que interrumpir la corrida no pierde nada y volver a lanzarla sigue donde iba.
+ * Recorre el listado de evaluaciones, abre las que tienen informes pendientes y
+ * descarga el PDF de cada persona. Es reanudable: cada archivo se marca en
+ * cuanto se guarda, así que interrumpir no pierde nada.
  *
- * Sobre `--sesiones`: el servidor tarda minutos en generar cada PDF y mantiene
- * el lock de la sesión mientras tanto, así que el paralelismo se consigue con
- * varias sesiones y no con varias peticiones. Conviene subirlo con cuidado y
- * mirando los errores: es una aplicación de producción ajena.
+ * POR QUÉ ESTO NO ES UN SIMPLE DESCARGADOR DE URLS
+ *
+ * La idea inicial era desacoplarlo del todo: la fase 1 cosecha las URLs y esta
+ * fase las pide por HTTP desde una sesión limpia. No funciona. El servidor
+ * responde 200 y entrega un PDF válido, pero vacío —110 KB, sin el nombre de la
+ * persona— salvo que la sesión tenga ABIERTO EL DETALLE de esa evaluación. Se
+ * descubrió tarde, con doce archivos ya dados por buenos.
+ *
+ * Así que hay que volver a navegar. Lo que sí se conserva de la fase 1 es el
+ * saber a qué evaluaciones hay que entrar y a quién le falta el informe, que es
+ * lo que evita abrir las ~980 evaluaciones cuando sólo interesan algunas.
  */
 import { conectar, desconectar } from '../mongo.js';
 import { leerCredenciales } from '../config.js';
+import { SesionEvaluaciones } from '../evaluaciones/navegador-eval.js';
+import { abrirListado, leerFilas, paginaActual, siguientePagina } from '../evaluaciones/listado.js';
+import { abrirDetalle, recorrerPersonas, DetalleVacio } from '../evaluaciones/detalle.js';
+import { cosecharUrl } from '../evaluaciones/cosecha-urls.js';
 import {
+  claveDeEvaluacion,
   informesPendientes,
   marcarInformeDescargado,
   marcarInformeError,
   resumenInformes,
 } from '../evaluaciones/mongo-eval.js';
-import { abrirSesiones, descargarInforme } from './descargador.js';
+import { MAX_PAGINAS } from '../evaluaciones/config-eval.js';
+import { descargarInforme } from './descargador.js';
 
 const log = (m) => console.log(`[${new Date().toLocaleTimeString('es-CO')}] ${m}`);
 
 const AYUDA = `
 Etapa 2 · fase 2 — descarga de los informes PDF
 
-  --limite <n>             descarga sólo n informes
+  --limite-eval <n>        procesa sólo n evaluaciones
   --sesiones <n>           sesiones en paralelo (por defecto 2)
   --destino <ruta>         carpeta de salida (por defecto ./informes)
   --reintentar-errores     vuelve sobre los que fallaron
-  --headed                 abre el navegador con ventana visible
+  --headed                 con ventana visible
   --ayuda                  esta ayuda
 
 Cada PDF se guarda como <id>.pdf junto a un <id>.json con el nombre, la cédula
-y la evaluación a la que pertenece. El id es único por persona y evaluación.
+y la evaluación. El id es único por persona y evaluación.
+
+Cada informe tarda entre uno y tres minutos: el servidor lo arma al pedirlo.
+El paralelismo sale de abrir varias sesiones, no de pedir varias cosas a la vez:
+ASP.NET serializa las peticiones de una misma sesión.
 `;
 
 function leerArgumentos(argv) {
-  const o = { limite: 0, sesiones: 2, destino: 'informes', reintentarErrores: false, headless: true };
+  const o = { limiteEval: 0, sesiones: 2, destino: 'informes', reintentarErrores: false, headless: true };
 
   for (let i = 2; i < argv.length; i++) {
     const arg = argv[i];
     const valor = () => argv[++i];
 
-    if (arg === '--limite') o.limite = Number(valor());
+    if (arg === '--limite-eval') o.limiteEval = Number(valor());
     else if (arg === '--sesiones') o.sesiones = Math.max(1, Number(valor()));
     else if (arg === '--destino') o.destino = valor();
     else if (arg === '--reintentar-errores') o.reintentarErrores = true;
@@ -59,6 +76,57 @@ function leerArgumentos(argv) {
   return o;
 }
 
+/**
+ * Descarga los informes pendientes de la evaluación que ya está abierta.
+ *
+ * Se recorre a la gente y se vuelve a pedir su URL en lugar de usar la guardada
+ * en la fase 1. Cuesta 330 ms por persona y evita depender de que los índices
+ * de fila sigan significando lo mismo que entonces: si alguien se dio de alta o
+ * de baja desde la cosecha, el índice guardado apuntaría a otra persona.
+ *
+ * @param {Map<string,Object>} pendientesPorId informes que faltan, por id
+ */
+async function descargarEvaluacionAbierta(sesion, pendientesPorId, opciones, contadores) {
+  await recorrerPersonas(sesion, async (personas) => {
+    for (const persona of personas) {
+      const url = await cosecharUrl(sesion, persona.indice);
+      if (!url.url || !url.id) {
+        log(`    · ${persona.nombre}: sin URL (${url.motivo ?? 'desconocido'})`);
+        continue;
+      }
+
+      const pendiente = pendientesPorId.get(url.id);
+      if (!pendiente) continue; // ya descargado en otra corrida, o no es de este worker
+
+      const t0 = Date.now();
+      const r = await descargarInforme(
+        sesion,
+        { ...pendiente, url: url.url, nombre: persona.nombre },
+        opciones.destino
+      ).catch((e) => ({ ok: false, motivo: e.message }));
+
+      const seg = ((Date.now() - t0) / 1000).toFixed(0);
+      const quien = `${persona.nombre} (${pendiente.documento ?? 'sin cédula'})`;
+
+      if (r.ok) {
+        await marcarInformeDescargado(pendiente.claveEvaluacion, url.id, {
+          archivo: r.archivo,
+          bytes: r.bytes,
+        });
+        contadores.ok++;
+        contadores.bytes += r.bytes;
+        log(`    ✓ ${url.id} · ${quien} · ${(r.bytes / 1024).toFixed(0)} KB · ${seg}s`);
+      } else {
+        await marcarInformeError(pendiente.claveEvaluacion, url.id, r.motivo);
+        contadores.errores++;
+        log(`    ✗ ${url.id} · ${quien} · ${r.motivo} · ${seg}s`);
+      }
+      pendientesPorId.delete(url.id);
+    }
+    return personas;
+  });
+}
+
 async function principal() {
   const opciones = leerArgumentos(process.argv);
   const [credencial] = leerCredenciales();
@@ -66,11 +134,7 @@ async function principal() {
   await conectar();
   log('MongoDB conectado');
 
-  const pendientes = await informesPendientes({
-    limite: opciones.limite,
-    reintentarErrores: opciones.reintentarErrores,
-  });
-
+  const pendientes = await informesPendientes({ reintentarErrores: opciones.reintentarErrores });
   if (!pendientes.length) {
     console.log('No hay informes pendientes. Usa --reintentar-errores para volver sobre los fallidos.');
     console.log('Estado:', await resumenInformes());
@@ -78,75 +142,96 @@ async function principal() {
     return;
   }
 
-  log(`Por descargar: ${pendientes.length} informes · ${opciones.sesiones} sesión(es) · destino "${opciones.destino}"`);
-  log('Cada informe tarda entre 2 y 4 minutos: el servidor lo genera al pedirlo.');
+  // Agrupados por evaluación: se abre cada una una sola vez y se bajan todos
+  // sus informes de una pasada.
+  const porEvaluacion = new Map();
+  for (const p of pendientes) {
+    if (!porEvaluacion.has(p.claveEvaluacion)) porEvaluacion.set(p.claveEvaluacion, new Map());
+    porEvaluacion.get(p.claveEvaluacion).set(p.id, p);
+  }
 
-  const { navegador, sesiones } = await abrirSesiones(credencial, opciones.sesiones, {
-    headless: opciones.headless,
-  });
-  log(`${sesiones.length} sesión(es) abiertas`);
+  const claves = [...porEvaluacion.keys()];
+  const objetivo = opciones.limiteEval ? claves.slice(0, opciones.limiteEval) : claves;
+  const asignadas = new Set(objetivo);
 
-  // Cola compartida: cada worker toma el siguiente en cuanto se libera.
-  let siguiente = 0;
-  const contadores = { ok: 0, errores: 0, bytes: 0 };
+  log(`Pendientes: ${pendientes.length} informes en ${claves.length} evaluación(es)`);
+  log(`A procesar: ${objetivo.length} evaluación(es) con ${opciones.sesiones} sesión(es)`);
+  log('Cada informe tarda entre uno y tres minutos: el servidor lo arma al pedirlo.');
+
+  const contadores = { ok: 0, errores: 0, bytes: 0, evaluaciones: 0 };
   const inicio = Date.now();
+  // Reparto round-robin: cada worker recorre el listado y atiende su turno.
+  const tomadas = new Set();
 
-  async function worker(sesion) {
-    while (siguiente < pendientes.length) {
-      const informe = pendientes[siguiente++];
-      const t0 = Date.now();
+  /**
+   * Un worker: recorre el listado de principio a fin y, al encontrar una
+   * evaluación asignada que nadie haya tomado, la abre y descarga lo suyo.
+   *
+   * Recorrer el listado entero cuesta unos minutos, despreciable frente a los
+   * minutos que cuesta cada informe. Reclamar las evaluaciones sobre la marcha
+   * evita tener que repartirlas de antemano sin saber cuánto tarda cada una.
+   */
+  async function worker(indice) {
+    const sesion = new SesionEvaluaciones(credencial, { headless: opciones.headless });
+    try {
+      await sesion.abrir();
+      await sesion.login();
+      await abrirListado(sesion);
+      log(`[worker-${indice}] sesión lista`);
 
-      const r = await descargarInforme(sesion, informe, opciones.destino).catch((e) => ({
-        ok: false,
-        motivo: e.message,
-      }));
+      for (let vuelta = 0; vuelta < MAX_PAGINAS; vuelta++) {
+        const pagina = await paginaActual(sesion.page);
+        const filas = await leerFilas(sesion.page);
 
-      const seg = ((Date.now() - t0) / 1000).toFixed(0);
-      const quien = `${informe.nombre ?? '?'} (${informe.documento ?? 'sin cédula'})`;
+        for (const fila of filas) {
+          const clave = claveDeEvaluacion(fila);
+          if (!asignadas.has(clave) || tomadas.has(clave)) continue;
+          tomadas.add(clave);
 
-      if (r.ok) {
-        await marcarInformeDescargado(informe.claveEvaluacion, informe.id, {
-          archivo: r.archivo,
-          bytes: r.bytes,
-        });
-        contadores.ok++;
-        contadores.bytes += r.bytes;
-        log(`  ✓ ${informe.id} · ${quien} · ${(r.bytes / 1024).toFixed(0)} KB · ${seg}s`);
-      } else {
-        await marcarInformeError(informe.claveEvaluacion, informe.id, r.motivo);
-        contadores.errores++;
-        log(`  ✗ ${informe.id} · ${quien} · ${r.motivo} · ${seg}s`);
+          const faltan = porEvaluacion.get(clave);
+          log(`[worker-${indice}] p${pagina} · ${fila.medicion.slice(0, 44)} · ${faltan.size} informe(s)`);
+
+          try {
+            await abrirDetalle(sesion, fila.indiceSelect);
+            await descargarEvaluacionAbierta(sesion, faltan, opciones, contadores);
+            contadores.evaluaciones++;
+          } catch (error) {
+            if (error instanceof DetalleVacio) {
+              log(`[worker-${indice}] detalle vacío, se salta`);
+            } else {
+              log(`[worker-${indice}] error: ${error.message.slice(0, 120)}`);
+              // La página puede quedar inservible: se recarga y se sigue.
+              await abrirListado(sesion).catch(() => {});
+            }
+          }
+        }
+
+        if (tomadas.size >= asignadas.size) break;
+        const avance = await siguientePagina(sesion);
+        if (!avance.avanzo) break;
       }
-
-      const hechos = contadores.ok + contadores.errores;
-      if (hechos % 10 === 0) informarProgreso(hechos, pendientes.length, contadores, inicio);
+    } finally {
+      await sesion.cerrar().catch(() => {});
+      log(`[worker-${indice}] terminado`);
     }
   }
 
   try {
-    await Promise.all(sesiones.map((s) => worker(s)));
+    await Promise.all(
+      Array.from({ length: opciones.sesiones }, (_, i) =>
+        worker(i + 1).catch((e) => log(`[worker-${i + 1}] abortado: ${e.message}`))
+      )
+    );
   } finally {
-    await navegador.close().catch(() => {});
-
     const minutos = ((Date.now() - inicio) / 60000).toFixed(1);
     console.log(`\n=== Fin en ${minutos} min ===`);
-    console.log(`  descargados  ${contadores.ok}`);
-    console.log(`  con error    ${contadores.errores}`);
-    console.log(`  total        ${(contadores.bytes / 1024 / 1024).toFixed(1)} MB`);
+    console.log(`  evaluaciones abiertas  ${contadores.evaluaciones}`);
+    console.log(`  informes descargados   ${contadores.ok}`);
+    console.log(`  con error              ${contadores.errores}`);
+    console.log(`  total                  ${(contadores.bytes / 1024 / 1024).toFixed(1)} MB`);
     console.log('\nEstado de los informes:', await resumenInformes());
     await desconectar();
   }
-}
-
-function informarProgreso(hechos, total, contadores, inicio) {
-  const transcurrido = (Date.now() - inicio) / 1000;
-  const porSegundo = hechos / transcurrido;
-  const restan = porSegundo > 0 ? (total - hechos) / porSegundo : 0;
-  const hhmm = (s) => `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
-  log(
-    `${hechos}/${total} · ok ${contadores.ok} · error ${contadores.errores} · ` +
-      `${(contadores.bytes / 1024 / 1024).toFixed(0)} MB · restan ~${hhmm(restan)}`
-  );
 }
 
 principal().catch(async (error) => {
