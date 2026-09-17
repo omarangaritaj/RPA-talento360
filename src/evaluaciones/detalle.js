@@ -169,7 +169,17 @@ export function paginaActualPersonas(page) {
   }, SEL_EVAL.detalle.personas);
 }
 
-/** Salta a una página concreta de la grilla de personas. */
+/**
+ * Salta a una página concreta de la grilla de personas.
+ *
+ * El éxito se mide por que el CONTENIDO haya cambiado, no por que el paginador
+ * declare el número esperado. Exigir esa igualdad dejó fuera a una evaluación de
+ * once personas: el salto a la segunda página funcionó, pero la comprobación no
+ * lo dio por bueno y el recorrido se cortó en diez, que es justo el tamaño de
+ * página y por tanto un resultado de aspecto inocente.
+ *
+ * @returns {Promise<boolean>} true si la grilla muestra contenido nuevo
+ */
 async function irAPaginaPersonas(sesion, objetivo) {
   const page = sesion.page;
   const enlace = `${SEL_EVAL.detalle.personas} a[href*="Page$${objetivo}"]`;
@@ -178,9 +188,8 @@ async function irAPaginaPersonas(sesion, objetivo) {
   const previa = await firmaContenido(page);
   await page.click(enlace);
   await sesion.esperarPostback();
-  await esperarContenidoEstable(page, previa, TIEMPOS_EVAL.esperaDetalle);
 
-  return (await paginaActualPersonas(page)) === objetivo;
+  return esperarContenidoEstable(page, previa, TIEMPOS_EVAL.esperaDetalle);
 }
 
 /**
@@ -200,36 +209,54 @@ async function irAPaginaPersonas(sesion, objetivo) {
  * @param {(personas:Array, pagina:number) => Promise<Array>} porPagina
  * @returns {Promise<{personas:Array, paginas:number}>}
  */
-export async function recorrerPersonas(sesion, porPagina) {
-  if ((await paginaActualPersonas(sesion.page)) !== 1) {
-    await irAPaginaPersonas(sesion, 1);
-  }
-
+export async function recorrerPersonas(sesion, porPagina, { esperados = 0 } = {}) {
   const acumulado = [];
   /** Los ids de botón ya vistos: red de seguridad contra lecturas repetidas. */
   const vistas = new Set();
   let paginas = 0;
+  let pasadas = 0;
 
-  for (let vuelta = 0; vuelta < MAX_PAGINAS_PERSONAS; vuelta++) {
-    const pagina = await paginaActualPersonas(sesion.page);
-    const personas = await leerPersonas(sesion.page);
-    paginas++;
-
-    const procesadas = await porPagina(personas, pagina);
-    for (const persona of procesadas) {
-      // La clave es la de la propia aplicación cuando está disponible: dos
-      // lecturas de la misma persona traen el mismo id de informe.
-      const clave = persona.informe?.id ?? `${pagina}#${persona.indice}#${persona.nombre}`;
-      if (vistas.has(clave)) continue;
-      vistas.add(clave);
-      acumulado.push(persona);
+  /** Una vuelta completa por todas las páginas de la grilla. */
+  async function recorrerUnaVez() {
+    if ((await paginaActualPersonas(sesion.page)) !== 1) {
+      await irAPaginaPersonas(sesion, 1);
     }
 
-    const siguiente = pagina + 1;
-    if (!(await irAPaginaPersonas(sesion, siguiente))) break;
+    for (let vuelta = 0; vuelta < MAX_PAGINAS_PERSONAS; vuelta++) {
+      const pagina = await paginaActualPersonas(sesion.page);
+      const personas = await leerPersonas(sesion.page);
+      if (pasadas === 0) paginas++;
+
+      const procesadas = await porPagina(personas, pagina);
+      for (const persona of procesadas) {
+        // La clave es la de la propia aplicación cuando está disponible: dos
+        // lecturas de la misma persona traen el mismo id de informe, así que
+        // repetir el recorrido no puede duplicar a nadie.
+        const clave = persona.informe?.id ?? `${pagina}#${persona.indice}#${persona.nombre}`;
+        if (vistas.has(clave)) continue;
+        vistas.add(clave);
+        acumulado.push(persona);
+      }
+
+      if (!(await irAPaginaPersonas(sesion, pagina + 1))) break;
+    }
+    pasadas++;
   }
 
-  return { personas: acumulado, paginas };
+  await recorrerUnaVez();
+
+  // Segunda pasada cuando falta gente respecto de lo que declara el listado.
+  //
+  // Se vio que una página interna puede leerse a medio pintar pese a la espera
+  // de estabilidad —una evaluación de catorce devolvió doce—, y el resultado no
+  // se distingue de uno correcto salvo por ese contador. Como la deduplicación
+  // usa el id del informe, volver a pasar sólo puede añadir lo que falte, nunca
+  // repetir. Cuesta unos segundos y sólo se paga cuando hay motivo.
+  if (esperados > 0 && acumulado.length < esperados) {
+    await recorrerUnaVez();
+  }
+
+  return { personas: acumulado, paginas, pasadas };
 }
 
 /**

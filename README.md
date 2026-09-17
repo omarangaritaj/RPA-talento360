@@ -1,10 +1,21 @@
 # RPA talento360
 
-Extrae las hojas de vida de adultos de `scouts.talento360.com.co` y las
-consolida en MongoDB junto con los datos de `HojaVidaSiscout.csv`.
+Extrae información de `scouts.talento360.com.co` a MongoDB. Son dos etapas
+independientes, cada una con su binario y su colección:
+
+| Etapa | Qué extrae | Colección | Binario |
+|-------|------------|-----------|---------|
+| **1 · Adultos** | Hojas de vida, consolidadas con `HojaVidaSiscout.csv` | `perfiles` | `src/main.js` |
+| **2 · Evaluaciones** | Evaluaciones de desempeño 360 y sus informes PDF | `evaluaciones` | `src/evaluaciones/main-eval.js` + `src/informes/main-informes.js` |
+
+La etapa 2 se apoya en la 1: resuelve las cédulas de evaluados y evaluadores
+contra `perfiles`, así que hay que correr la 1 primero.
 
 El proceso es de **solo lectura**: no crea, edita ni elimina nada en la
 aplicación de origen.
+
+> Lo que sigue documenta la **etapa 1**. La **etapa 2** está al final, en
+> [Etapa 2 · evaluaciones de desempeño](#etapa-2--evaluaciones-de-desempeño).
 
 ## Requisitos
 
@@ -279,3 +290,213 @@ guardar en cualquier sección, importar y "Entrar Como".
   búsqueda antes de concluir que un documento no está.
 - El buscador es sensible a los espacios: un `"1053860607 "` con espacio final
   no devuelve nada.
+
+---
+
+# Etapa 2 · evaluaciones de desempeño
+
+Extrae las evaluaciones 360 de `GestionDeEvaluacion.aspx`: quién evalúa a quién,
+con qué relación jerárquica y en qué estado, más el informe PDF de cada persona.
+
+Va en dos fases, y son binarios separados a propósito: la fase 1 dura unas horas
+y la fase 2 puede durar días. Si fueran uno solo, un fallo en la descarga
+obligaría a recosechar los datos.
+
+```bash
+# Fase 1 — datos + URLs de los informes (~3-4 h)
+node src/evaluaciones/main-eval.js
+
+# Fase 2 — descarga de los PDF (reanudable, se puede cortar y seguir)
+node src/informes/main-informes.js --sesiones 4
+```
+
+## Fase 1 — cosecha
+
+| Opción | Qué hace |
+|--------|----------|
+| `--limite-paginas <n>` | procesa sólo n páginas (lote de prueba) |
+| `--desde-pagina <n>` | empieza en esa página, para reanudar |
+| `--limite-eval <n>` | procesa sólo n evaluaciones y termina |
+| `--sin-informes` | no cosecha las URLs de los PDF, sólo los datos |
+| `--reprocesar` | vuelve sobre evaluaciones ya guardadas |
+| `--incluir-vacias` | abre también las que marcan progreso `0/0` |
+| `--headed` | con ventana visible |
+
+Es idempotente: las evaluaciones ya procesadas se saltan, así que volver a
+lanzarlo continúa donde iba.
+
+## Fase 2 — descarga de los PDF
+
+| Opción | Qué hace |
+|--------|----------|
+| `--limite <n>` | descarga sólo n informes |
+| `--sesiones <n>` | sesiones en paralelo (por defecto 2) |
+| `--destino <ruta>` | carpeta de salida (por defecto `./informes`) |
+| `--reintentar-errores` | vuelve sobre los que fallaron |
+
+Cada informe se guarda como `<id>.pdf` junto a un `<id>.json` con el nombre, la
+cédula y la evaluación. El `id` es único por persona **y** evaluación, de modo
+que las N evaluaciones de una misma persona nunca se confunden.
+
+**Sobre `--sesiones`:** el servidor genera cada PDF en el momento de pedirlo y
+tarda entre dos y cuatro minutos, manteniendo tomado el lock de esa sesión. Dos
+peticiones sobre la misma sesión hacen cola en vez de ir en paralelo, así que el
+paralelismo se consigue con varias sesiones: cada worker hace su propio login y
+recibe su propia cookie. Funciona incluso con una sola credencial. Súbelo con
+cuidado y mirando los errores: es una aplicación de producción ajena.
+
+## Estructura de la colección `evaluaciones`
+
+```js
+{
+  claveEvaluacion: "a1b2c3…",              // sha1 de nivel|region|grupo|fecha|medicion
+  nivel, region, grupo, fecha, medicion, estadoEval,
+  progreso: { completadas: 2, total: 8, crudo: "2/8" },
+  paginaOrigen: 3, paginasPersonas: 2,
+
+  evaluados: [{
+    nombre, cargo, email, area,
+    documento: "52773406",
+    matchPor: "email",                     // cómo se resolvió la cédula
+    informe: { id, group, cargo, url, estado, archivo, bytes },
+    evaluadores: [{
+      relacion: "jefe",                    // autoevaluacion | jefe | par | subalterno
+      nombre, cargo,
+      estado: "Finalizada",                // Finalizada | Iniciada | Pendiente
+      documento, matchPor
+    }]
+  }],
+
+  estado: "ok",                            // pendiente | ok | vacia | error
+  verificacion: { declaradosEnListado, leidosEnDetalle, coincide }
+}
+```
+
+`matchPor` dice cómo se llegó a cada cédula, y es tan importante como la cédula:
+permite auditar qué parte de los datos descansa sobre una coincidencia de nombre
+y cuál sobre un email.
+
+| Valor | Significado |
+|-------|-------------|
+| `email` | coincidencia exacta de correo con `perfiles` (la más fiable) |
+| `nombre` | coincidencia de nombre normalizado, sin tildes |
+| `nombre_via_evaluado` | resuelto por un evaluado que sí traía correo |
+| `autoevaluacion` | es la misma persona que el evaluado |
+| `ambiguo_email` / `ambiguo_nombre` | varios perfiles coinciden: queda sin resolver, con `candidatos` |
+| `sin_match` | no está en `perfiles` |
+
+## Por qué el email y no el nombre
+
+Sobre los 2.962 perfiles de la etapa 1:
+
+| Llave | Valores distintos | Colisiones |
+|-------|-------------------|------------|
+| Email | 2.960 | 2 |
+| Nombre completo | 2.959 | 3 |
+
+Las colisiones no son homónimos: son **erratas de cédula en el origen**. Los
+pares detectados difieren en un dígito de más (`19434525` contra `119434525`,
+`94410520` contra `944105200`), o sea la misma persona cargada dos veces. Por
+eso se marcan como `ambiguo` en lugar de elegir una: la decisión es del humano.
+
+Los evaluadores no traen correo, sólo nombre. Como una misma persona aparece
+como evaluada en una evaluación y como evaluadora en otra, los evaluados ya
+resueltos alimentan un índice nombre→cédula que cubre a buena parte de ellos.
+
+## Consultar los resultados
+
+```js
+// personas cuya cédula no se pudo resolver
+db.evaluaciones.aggregate([
+  { $unwind: "$evaluados" },
+  { $match: { "evaluados.matchPor": { $in: ["sin_match", "ambiguo_nombre", "ambiguo_email"] } } },
+  { $project: { _id: 0, medicion: 1, nombre: "$evaluados.nombre", motivo: "$evaluados.matchPor" } }
+])
+
+// evaluaciones donde el conteo leído no cuadra con el que declara el listado
+db.evaluaciones.find({ "verificacion.coincide": false },
+                     { medicion: 1, progreso: 1, verificacion: 1, _id: 0 })
+
+// todas las evaluaciones de una persona
+db.evaluaciones.find({ "evaluados.documento": "52773406" },
+                     { medicion: 1, fecha: 1, grupo: 1, _id: 0 })
+```
+
+## Notas sobre esta página
+
+Tres comportamientos de la aplicación explican casi todo el código de espera de
+`src/evaluaciones/detalle.js`. Los tres producían datos plausibles y **ningún
+error**, que es la peor combinación posible.
+
+- **El detalle se dibuja debajo del listado, en la misma página.** La tabla de
+  la evaluación anterior sigue en pantalla, así que esperar a que "exista" se
+  cumple al instante con los datos de quien no es. Se borra la tabla del DOM
+  antes de pedir la nueva y se espera por una huella del contenido.
+
+- **La grilla de evaluados pagina cada diez**, y el índice de página lo guarda
+  el servidor: sobrevive al cambio de evaluación. Tras paginar una de catorce
+  personas, la siguiente abría en su página dos y devolvía dos evaluados de
+  doce. Al empezar cada evaluación se vuelve a la página uno.
+
+- **Al paginar, la grilla pasa por estados intermedios** en los que conviven
+  filas viejas y nuevas. Una lectura ahí duplica personas: una evaluación de
+  catorce llegó a devolver diecinueve con sólo catorce informes distintos. Se
+  exige que la huella del contenido se repita varios sondeos seguidos, y se
+  deduplica por `informe.id`.
+
+Cada evaluación guarda en `verificacion` el número de evaluados que declara la
+columna "Progreso" junto al que se leyó de verdad. **Es la única red que
+convierte estos fallos en un aviso visible**, y es lo primero que hay que mirar
+tras una corrida.
+
+### El informe PDF
+
+El botón de informe no es un enlace: dispara un `__doPostBack` cuya respuesta
+trae un bloque de script con
+
+```js
+window.open('../Formularios/informe_Desemp.aspx?id=1730&group=2098&cargo=381032','_blank');
+```
+
+Esos números **no están en el DOM**: los resuelve el servidor en el postback.
+De los tres, `cargo` identifica el puesto y lo comparten personas distintas;
+`id` es el único que identifica un informe sin ambigüedad, y es el que nombra
+el archivo.
+
+Si se deja que la pestaña navegue, el navegador pide el informe con la misma
+cookie. ASP.NET serializa las peticiones de una sesión, así que durante los dos
+a cuatro minutos que tarda la generación **todos los demás postbacks esperan**:
+medido, tras el primer informe los cinco clicks siguientes no devolvieron nada
+en 160 segundos. Interceptando `window.open` se guarda la URL sin navegar, y
+cada informe pasa a costar ~330 ms. Sobre ~4.200 informes, es la diferencia
+entre 187 horas y menos de media.
+
+### Controles que nunca se pulsan
+
+El guard compara **por patrón**, no por id exacto, porque los controles de esta
+página llevan el índice de fila al final y una lista fija no los atraparía.
+
+| Control | Riesgo |
+|---------|--------|
+| `imgBtn_EliminarPersonas_N` | elimina al evaluado de la evaluación |
+| `imgBtn_Eliminar_Eval_N` | elimina a un evaluador |
+| `imgBtn_Recordatorio_N` | **envía un correo real** al evaluador pendiente |
+
+El de recordatorio merece atención: ocupa en la columna de acciones el mismo
+lugar que el botón de borrar de los evaluadores ya finalizados, así que un click
+por posición cae en uno o en otro según el estado de la fila.
+
+## Archivos de la etapa 2
+
+| Archivo | Qué hace |
+|---------|----------|
+| `src/evaluaciones/config-eval.js` | URLs, selectores, patrones prohibidos, tiempos |
+| `src/evaluaciones/navegador-eval.js` | Guard por patrón e intercepción de `window.open` |
+| `src/evaluaciones/listado.js` | Recorrido y paginación del listado de evaluaciones |
+| `src/evaluaciones/detalle.js` | Evaluados, evaluadores y esperas de sincronización |
+| `src/evaluaciones/cosecha-urls.js` | Captura de las URLs de los informes |
+| `src/evaluaciones/match.js` | Resolución de cédulas contra `perfiles` |
+| `src/evaluaciones/mongo-eval.js` | Esquema `evaluaciones` y checkpoint |
+| `src/evaluaciones/main-eval.js` | CLI de la fase 1 |
+| `src/informes/descargador.js` | Sesiones paralelas y descarga verificada |
+| `src/informes/main-informes.js` | CLI de la fase 2 |

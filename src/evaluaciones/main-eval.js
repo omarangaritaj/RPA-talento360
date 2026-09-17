@@ -131,7 +131,10 @@ async function procesarEvaluacion(sesion, fila, contexto) {
               : { estado: ESTADOS_INFORME.sinUrl, ultimoError: encontrada?.motivo ?? 'sin intento' },
         };
       });
-    }
+    },
+    // El total que declara la columna "Progreso" del listado. Si la lectura se
+    // queda corta, `recorrerPersonas` vuelve a pasar antes de darse por hecha.
+    { esperados: fila.progreso.total }
   );
 
   if (!evaluados.length) {
