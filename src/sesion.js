@@ -115,10 +115,19 @@ export class Sesion {
   }
 
   /**
-   * Espera a que MsAjax termine el postback parcial en curso.
-   * Si la página no usa PageRequestManager, cae a networkidle.
+   * Espera a que la página quede estable tras accionar un control.
+   *
+   * Los controles de esta aplicación se comportan de dos maneras distintas y
+   * no hay forma de saberlo de antemano: "Editar" navega de verdad a
+   * HojaDeVida.aspx, mientras que los "Mostrar Más" son postbacks parciales
+   * de MsAjax que no cambian de URL. Esperar sólo lo segundo hacía que
+   * evaluate() cayera en mitad de la navegación con "Execution context was
+   * destroyed". Cubrimos ambos casos, en orden.
    */
   async esperarPostback(timeout = TIEMPOS.esperaPostback) {
+    // 1. navegación completa
+    await this.page.waitForLoadState('domcontentloaded', { timeout }).catch(() => {});
+    // 2. postback parcial de MsAjax
     await this.page
       .waitForFunction(
         () => {
@@ -131,6 +140,31 @@ export class Sesion {
       .catch(() => {});
     await this.page.waitForLoadState('networkidle', { timeout }).catch(() => {});
     await this.page.waitForTimeout(TIEMPOS.pausaTrasPostback);
+    // 3. confirmar que el contexto de ejecución responde antes de devolver
+    await this.page.evaluate(() => document.readyState).catch(async () => {
+      await this.page.waitForLoadState('domcontentloaded', { timeout }).catch(() => {});
+    });
+  }
+
+
+  /**
+   * Espera a que HojaDeVida.aspx termine de renderizar.
+   *
+   * La página se arma por partes: durante ~2s tras el click en Editar el DOM
+   * existe pero está incompleto (faltan secciones y los botones "Mostrar Más").
+   * Esperar por tiempo fijo es frágil, así que esperamos dos anclas concretas:
+   * el documento cargado y los cuatro botones de paginación presentes.
+   */
+  async esperarHojaVidaLista(timeout = TIEMPOS.timeoutAccion) {
+    await this.page.waitForFunction(
+      (ids) => {
+        const doc = document.getElementById('MainContent_txt_Documento');
+        if (!doc || !doc.value) return false;
+        return ids.every((id) => document.getElementById(id) !== null);
+      },
+      SEL.mostrarMas.map((m) => m.selector.replace('#', '')),
+      { timeout, polling: 250 }
+    );
   }
 
   /**

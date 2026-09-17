@@ -80,6 +80,29 @@ export const PREFIJOS_MODALES = [
   'MainContent_idiomasperfilprofesional_',
 ];
 
+/**
+ * Controles que pertenecen a los formularios de alta embebidos en la propia
+ * página (agregar cargo, agregar vínculo familiar). No llevan prefijo propio y
+ * están siempre vacíos: sin excluirlos se cuelan siete campos nulos por perfil.
+ */
+export const CAMPOS_FORMULARIO_ALTA = [
+  'MainContent_txt_Familiar',
+  'MainContent_Cbo_TipVinculo',
+  'MainContent_Cbo_Cargos',
+  'MainContent_Cbo_Nivel',
+  'MainContent_Cbo_Asesor',
+  'MainContent_txt_FechInicio',
+  'MainContent_Cbo_EstadoCargo',
+];
+
+/** Textos que la aplicación usa como placeholder de "sin valor". */
+export const PLACEHOLDERS = [
+  'Seleccione',
+  'Seleccione un Cargo',
+  'Seleccione-Seleccione / Seleccione-Seleccione',
+  'Seleccione-Seleccione',
+];
+
 /** Tiempos. La página es lenta de forma intermitente: los timeouts son generosos. */
 export const TIEMPOS = {
   timeoutNavegacion: 180_000,
