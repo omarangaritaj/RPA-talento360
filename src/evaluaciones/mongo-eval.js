@@ -189,6 +189,88 @@ export function guardarFalloEvaluacion(clave, fila, { estado, mensaje, paginaOri
   );
 }
 
+/**
+ * Informes que todavía hay que descargar, aplanados a una lista de trabajo.
+ *
+ * Se devuelve `id` además de la clave de la evaluación porque es lo que
+ * identifica al informe sin ambigüedad: `cargo` es el puesto y lo comparten
+ * personas distintas, y el índice de fila se renumera en cada página.
+ *
+ * @param {{limite?:number, reintentarErrores?:boolean}} opciones
+ */
+export async function informesPendientes({ limite = 0, reintentarErrores = false } = {}) {
+  const estados = [ESTADOS_INFORME.pendiente];
+  if (reintentarErrores) estados.push(ESTADOS_INFORME.error);
+
+  const filas = await Evaluacion.aggregate([
+    { $match: { 'evaluados.informe.estado': { $in: estados } } },
+    { $unwind: '$evaluados' },
+    {
+      $match: {
+        'evaluados.informe.estado': { $in: estados },
+        'evaluados.informe.url': { $nin: [null, ''] },
+      },
+    },
+    {
+      $project: {
+        _id: 0,
+        claveEvaluacion: 1,
+        medicion: 1,
+        grupo: 1,
+        id: '$evaluados.informe.id',
+        url: '$evaluados.informe.url',
+        nombre: '$evaluados.nombre',
+        documento: '$evaluados.documento',
+        intentos: '$evaluados.informe.intentos',
+      },
+    },
+    ...(limite > 0 ? [{ $limit: limite }] : []),
+  ]);
+
+  return filas;
+}
+
+/** Marca un informe como descargado. `informe.id` es único dentro de su evaluación. */
+export function marcarInformeDescargado(claveEvaluacion, id, { archivo, bytes }) {
+  return Evaluacion.updateOne(
+    { claveEvaluacion, 'evaluados.informe.id': id },
+    {
+      $set: {
+        'evaluados.$.informe.estado': ESTADOS_INFORME.descargado,
+        'evaluados.$.informe.archivo': archivo,
+        'evaluados.$.informe.bytes': bytes,
+        'evaluados.$.informe.descargadoEn': new Date(),
+        'evaluados.$.informe.ultimoError': null,
+      },
+      $inc: { 'evaluados.$.informe.intentos': 1 },
+    }
+  );
+}
+
+/** Registra un fallo de descarga sin perder el resto del documento. */
+export function marcarInformeError(claveEvaluacion, id, mensaje) {
+  return Evaluacion.updateOne(
+    { claveEvaluacion, 'evaluados.informe.id': id },
+    {
+      $set: {
+        'evaluados.$.informe.estado': ESTADOS_INFORME.error,
+        'evaluados.$.informe.ultimoError': (mensaje ?? '').slice(0, 500),
+      },
+      $inc: { 'evaluados.$.informe.intentos': 1 },
+    }
+  );
+}
+
+/** Conteo de informes por estado, para saber cuánto falta. */
+export async function resumenInformes() {
+  const filas = await Evaluacion.aggregate([
+    { $unwind: '$evaluados' },
+    { $match: { 'evaluados.informe': { $ne: null } } },
+    { $group: { _id: '$evaluados.informe.estado', total: { $sum: 1 } } },
+  ]);
+  return Object.fromEntries(filas.map((f) => [f._id ?? 'sin_informe', f.total]));
+}
+
 /** Conteos para el informe final. */
 export async function resumenEvaluaciones() {
   const [porEstado] = await Promise.all([

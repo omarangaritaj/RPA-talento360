@@ -4,3 +4,6 @@ node_modules/
 datos/
 capturas/
 *.log
+
+# PDFs descargados por la fase 2: son datos, no código
+/informes/
