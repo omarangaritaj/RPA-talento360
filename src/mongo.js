@@ -162,6 +162,40 @@ export function guardarFallo(documento, { estado, mensaje }) {
   );
 }
 
+/**
+ * Estados que cuentan como "ya consultado": la ficha se buscó y el resultado
+ * se conoce. `error` queda fuera a propósito — ahí la consulta no llegó a
+ * completarse, así que reintentarla sí tiene sentido.
+ */
+export const ESTADOS_CONSULTADOS = [ESTADOS.ok, ESTADOS.noEncontrado];
+
+/**
+ * Filtra de una lista los documentos que ya fueron consultados.
+ *
+ * Hace idempotente cualquier modo de ejecución, incluido `--solo`, que por
+ * diseño ignora el estado para permitir reprocesar a propósito.
+ *
+ * @param {string[]} documentos
+ * @returns {Promise<{procesar:string[], omitidos:string[]}>}
+ */
+export async function separarYaConsultados(documentos) {
+  if (!documentos.length) return { procesar: [], omitidos: [] };
+
+  const consultados = new Set(
+    (
+      await Perfil.find(
+        { documento: { $in: documentos }, estado: { $in: ESTADOS_CONSULTADOS } },
+        { documento: 1, _id: 0 }
+      ).lean()
+    ).map((p) => p.documento)
+  );
+
+  return {
+    procesar: documentos.filter((d) => !consultados.has(d)),
+    omitidos: documentos.filter((d) => consultados.has(d)),
+  };
+}
+
 /** Conteo por estado, para el informe final. */
 export async function resumen() {
   const filas = await Perfil.aggregate([{ $group: { _id: '$estado', total: { $sum: 1 } } }]);

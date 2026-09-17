@@ -42,6 +42,7 @@ node src/main.js                    # corrida completa, con rampa
 node src/main.js --reintentar-errores
 node src/main.js --solo 52427771,94501035
 node src/main.js --workers 2        # concurrencia fija, sin rampa
+node src/main.js --omitir-procesados
 node src/main.js --ayuda
 ```
 
@@ -56,6 +57,7 @@ node src/main.js --ayuda
 | `--headless` | Sin ventana. Es el valor por defecto. |
 | `--slow-mo <ms>` | Pausa entre acciones del navegador. Sólo para observar; no sustituye a la pausa entre perfiles. |
 | `--reintentar-errores` | Incluye los documentos en estado `error` además de los `pendiente`. |
+| `--omitir-procesados` | Salta los que ya fueron consultados (`ok` o `no_encontrado`). Hace idempotente también a `--solo`. |
 | `--sin-sembrar` | No relee el CSV. Útil cuando la colección ya está sembrada. |
 | `--ayuda` | Muestra la ayuda. |
 
@@ -80,11 +82,25 @@ tras 3 errores encadenados retrocede.
 | 2       | 2       | 1500 ms |
 | 3       | 3       | 1000 ms |
 
-### Reanudación
+### Reanudación e idempotencia
 
 El estado vive en la propia colección, así que una corrida interrumpida se
 retoma sola: al volver a ejecutar sólo se procesa lo que quedó `pendiente`.
 Con ~3.000 perfiles a varios segundos cada uno, eso no es una comodidad.
+
+Por eso el modo normal ya es idempotente: repetir `node src/main.js` no vuelve
+a consultar nada que esté en `ok`. La excepción es `--solo`, que ignora el
+estado a propósito para poder reprocesar un perfil concreto a mano. Cuando no
+quieras esa excepción, añade `--omitir-procesados`:
+
+```bash
+node src/main.js --solo 52427771 --omitir-procesados   # no hace nada si ya está
+node src/main.js --solo 52427771                       # lo reprocesa siempre
+```
+
+`--omitir-procesados` considera consultados los estados `ok` y `no_encontrado`
+—la ficha se buscó y el resultado se conoce— pero no `error`, donde la consulta
+no llegó a completarse y reintentar sí tiene sentido.
 
 ## Estructura de la colección `perfiles`
 

@@ -6,9 +6,10 @@
  *   node src/main.js                           # corrida completa
  *   node src/main.js --reintentar-errores      # vuelve sobre los fallidos
  *   node src/main.js --solo 52427771,94501035  # documentos concretos
+ *   node src/main.js --omitir-procesados       # salta los ya consultados
  */
 import { leerPersonas } from './csv.js';
-import { conectar, desconectar, sembrarDesdeCsv, pendientes, resumen } from './mongo.js';
+import { conectar, desconectar, sembrarDesdeCsv, pendientes, resumen, separarYaConsultados } from './mongo.js';
 import { ejecutar } from './orquestador.js';
 import { leerCredenciales } from './config.js';
 
@@ -23,6 +24,7 @@ function leerArgumentos(argv) {
     solo: [],
     sembrar: true,
     workers: 0,
+    omitirProcesados: false,
   };
 
   for (let i = 2; i < argv.length; i++) {
@@ -37,6 +39,7 @@ function leerArgumentos(argv) {
     else if (arg === '--reintentar-errores') opciones.reintentarErrores = true;
     else if (arg === '--solo') opciones.solo = valor().split(',').map((d) => d.trim()).filter(Boolean);
     else if (arg === '--sin-sembrar') opciones.sembrar = false;
+    else if (arg === '--omitir-procesados') opciones.omitirProcesados = true;
     else if (arg === '--ayuda' || arg === '-h') { console.log(AYUDA); process.exit(0); }
     else { console.error(`Opción desconocida: ${arg}\n${AYUDA}`); process.exit(1); }
   }
@@ -53,6 +56,8 @@ RPA talento360 — extracción de hojas de vida a MongoDB
   --headless              sin ventana (por defecto)
   --slow-mo <ms>          ralentiza cada acción, útil para observar
   --reintentar-errores    vuelve a intentar los que quedaron en error
+  --omitir-procesados     salta los que ya fueron consultados (ok o sin ficha).
+                          Hace idempotente también a --solo
   --sin-sembrar           no relee el CSV, usa lo que ya hay en Mongo
   --ayuda                 esta ayuda
 `;
@@ -74,12 +79,28 @@ async function principal() {
     console.log(`Siembra: ${siembra.insertados} nuevos, ${siembra.existentes} ya existían`);
   }
 
-  const documentos = opciones.solo.length
+  // El camino normal ya es idempotente: sólo toma los que están pendientes.
+  // `--solo` ignora el estado a propósito, para poder reprocesar a mano; por
+  // eso `--omitir-procesados` existe y se aplica después, sobre cualquier modo.
+  let documentos = opciones.solo.length
     ? opciones.solo
     : await pendientes({ limite: opciones.limite, reintentarErrores: opciones.reintentarErrores });
 
+  if (opciones.omitirProcesados) {
+    const { procesar, omitidos } = await separarYaConsultados(documentos);
+    if (omitidos.length) {
+      console.log(`Omitidos por ya estar consultados: ${omitidos.length}` +
+        (omitidos.length <= 10 ? ` (${omitidos.join(', ')})` : ''));
+    }
+    documentos = procesar;
+  }
+
   if (!documentos.length) {
-    console.log('No hay documentos pendientes. Usa --reintentar-errores para volver sobre los fallidos.');
+    console.log(
+      opciones.omitirProcesados
+        ? 'Nada por hacer: todos los documentos solicitados ya fueron consultados.'
+        : 'No hay documentos pendientes. Usa --reintentar-errores para volver sobre los fallidos.'
+    );
     await desconectar();
     return;
   }
