@@ -146,17 +146,32 @@ export async function ejecutar(documentos, credenciales, opciones = {}) {
     );
   }
 
-  /** Un worker: abre sesión, toma de la cola y procesa hasta agotarla. */
+  /**
+   * Un worker: espera su turno según el escalón, toma de la cola y procesa.
+   *
+   * Los workers por encima del escalón actual quedan en espera en vez de
+   * terminar: si salieran definitivamente, la rampa no podría subir nunca y
+   * toda la corrida se haría con un solo worker.
+   *
+   * El navegador se abre de forma perezosa, en la primera vuelta en la que al
+   * worker le toca trabajar, para no dejar sesiones abiertas sin uso.
+   */
   async function worker(credencial) {
-    const sesion = new Sesion(credencial, opciones);
-    await sesion.abrir();
-    try {
-      await sesion.login();
-      log(`[${sesion.etiqueta}] sesión iniciada como ${credencial.usuario}`);
+    let sesion = null;
 
-      while (true) {
-        // Si la rampa bajó, los workers sobrantes se retiran.
-        if (credencial.id > rampa.workers) break;
+    try {
+      while (cola.restantes > 0) {
+        if (credencial.id > rampa.workers) {
+          await dormir(2000); // en espera: la rampa todavía puede subir
+          continue;
+        }
+
+        if (!sesion) {
+          sesion = new Sesion(credencial, opciones);
+          await sesion.abrir();
+          await sesion.login();
+          log(`[${sesion.etiqueta}] sesión iniciada como ${credencial.usuario}`);
+        }
 
         const documento = cola.siguiente();
         if (!documento) break;
@@ -170,11 +185,13 @@ export async function ejecutar(documentos, credenciales, opciones = {}) {
         await dormir(rampa.actual.delayMs);
       }
     } finally {
-      if (sesion.escriturasBloqueadas.length) {
-        log(`[${sesion.etiqueta}] ATENCIÓN: el guard bloqueó ${sesion.escriturasBloqueadas.length} intento(s) de escritura`);
+      if (sesion) {
+        if (sesion.escriturasBloqueadas.length) {
+          log(`[${sesion.etiqueta}] ATENCIÓN: el guard bloqueó ${sesion.escriturasBloqueadas.length} intento(s) de escritura`);
+        }
+        await sesion.cerrar();
+        log(`[${sesion.etiqueta}] finalizado`);
       }
-      await sesion.cerrar();
-      log(`[${sesion.etiqueta}] finalizado`);
     }
   }
 

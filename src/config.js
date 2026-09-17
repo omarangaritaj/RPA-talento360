@@ -148,6 +148,25 @@ export function leerCredenciales() {
     );
   }
 
+  // Varios workers sobre la misma cuenta se pisan el estado de sesión en el
+  // servidor: ASP.NET WebForms lo guarda allí, no en el navegador. Repetir la
+  // cuenta anula el aislamiento y puede devolver la ficha de otro documento.
+  const usuariosUnicos = new Set(credenciales.map((c) => c.usuario.toLowerCase()));
+  if (usuariosUnicos.size < credenciales.length) {
+    console.warn(
+      `AVISO: hay ${credenciales.length} credenciales pero sólo ${usuariosUnicos.size} ` +
+        `cuenta(s) distinta(s). Los workers que comparten cuenta comparten sesión en el ` +
+        `servidor y pueden interferir entre sí. Se usará una sola por cuenta.`
+    );
+    const vistos = new Set();
+    return credenciales.filter((c) => {
+      const clave = c.usuario.toLowerCase();
+      if (vistos.has(clave)) return false;
+      vistos.add(clave);
+      return true;
+    });
+  }
+
   return credenciales;
 }
 
