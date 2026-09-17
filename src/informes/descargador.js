@@ -20,6 +20,7 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { chromium } from 'playwright';
 import { URLS, SEL } from '../config.js';
+import { URL_EVALUACIONES } from '../evaluaciones/config-eval.js';
 
 /** Un PDF de verdad empieza por esta firma. Cualquier otra cosa es una página de error. */
 const FIRMA_PDF = '%PDF-';
@@ -60,7 +61,18 @@ export async function abrirSesiones(credencial, cantidad, { headless = true } = 
       throw new Error(`Login rechazado para "${credencial.usuario}" al abrir la sesión ${i}`);
     }
 
-    // La página ya no hace falta: sólo queríamos la cookie en el contexto.
+    // Visita obligada al listado de evaluaciones antes de pedir ningún informe.
+    //
+    // No es una precaución: `informe_Desemp.aspx` responde HTTP 500 a una sesión
+    // recién autenticada que no haya pasado por aquí. Se midió: con sólo el
+    // login devuelve 500 en 74 s; tras visitar esta página, el mismo informe
+    // llega en 3 s. Bastan la visita al listado —no hace falta abrir el detalle
+    // de ninguna evaluación— porque lo que el informe necesita es el estado que
+    // la página deja en la sesión del servidor.
+    await pagina.goto(URL_EVALUACIONES, { waitUntil: 'domcontentloaded' });
+    await pagina.waitForTimeout(1500);
+
+    // La página ya no hace falta: sólo queríamos la cookie y el estado.
     await pagina.close().catch(() => {});
     sesiones.push({ etiqueta: `descarga-${i}`, request: contexto.request, contexto });
   }
