@@ -298,52 +298,148 @@ guardar en cualquier sección, importar y "Entrar Como".
 Extrae las evaluaciones 360 de `GestionDeEvaluacion.aspx`: quién evalúa a quién,
 con qué relación jerárquica y en qué estado, más el informe PDF de cada persona.
 
-Va en dos fases, y son binarios separados a propósito: la fase 1 dura unas horas
-y la fase 2 puede durar días. Si fueran uno solo, un fallo en la descarga
-obligaría a recosechar los datos.
+Va en dos fases, y son binarios separados a propósito. La fase 1 deja en Mongo
+todo lo que se puede leer de la pantalla; la fase 2 baja los PDF, que cuestan
+casi tres minutos cada uno. Juntarlas haría que un fallo en la descarga obligara
+a recosechar los datos, y los datos son la parte cara de recuperar.
+
+**La fase 1 hay que correrla primero.** La fase 2 se apoya en lo que dejó: sin
+eso no sabe a qué evaluaciones entrar ni a quién le falta el informe.
+
+## Cómo correrlo, de principio a fin
 
 ```bash
-# Fase 1 — datos + URLs de los informes (~3-4 h)
-node src/evaluaciones/main-eval.js
+# 0. Sólo la primera vez
+npm install
+npx playwright install chromium
+```
 
-# Fase 2 — descarga de los PDF (reanudable, se puede cortar y seguir)
+**Paso 1 — probar la cosecha con una página, mirando la pantalla.**
+Sirve para confirmar que el login funciona y ver qué está clickeando:
+
+```bash
+node src/evaluaciones/main-eval.js --limite-paginas 1 --headed
+```
+
+**Paso 2 — la cosecha completa.** Unas 2,2 horas medidas sobre 10 páginas de
+muestra. Se puede cortar con Ctrl+C: al relanzarla sigue donde quedó.
+
+```bash
+node src/evaluaciones/main-eval.js
+```
+
+**Paso 3 — revisar que no se haya perdido nada.** Esto no es opcional: es lo
+único que distingue una corrida buena de una que guardó datos plausibles pero
+equivocados. Las cuatro consultas están en
+[Verificar una corrida](#verificar-una-corrida); la primera, y la que nunca hay
+que saltarse, es:
+
+```js
+db.evaluaciones.find({ "verificacion.coincide": false })
+```
+
+**Paso 4 — probar la descarga con una evaluación.**
+
+```bash
+node src/informes/main-informes.js --limite-eval 1
+```
+
+**Paso 5 — la descarga completa.** Unas 42 horas con 4 sesiones. Empieza en 4,
+mira la tasa de error de los primeros informes y sube sólo si va limpio: es una
+aplicación de producción ajena.
+
+```bash
 node src/informes/main-informes.js --sesiones 4
 ```
 
+Si se interrumpe, el mismo comando la retoma. Nada de lo descargado se repite.
+
 ## Fase 1 — cosecha
+
+```bash
+node src/evaluaciones/main-eval.js [opciones]
+```
 
 | Opción | Qué hace |
 |--------|----------|
-| `--limite-paginas <n>` | procesa sólo n páginas (lote de prueba) |
+| `--limite-paginas <n>` | procesa sólo n páginas del listado (lote de prueba) |
 | `--desde-pagina <n>` | empieza en esa página, para reanudar |
 | `--limite-eval <n>` | procesa sólo n evaluaciones y termina |
 | `--sin-informes` | no cosecha las URLs de los PDF, sólo los datos |
 | `--reprocesar` | vuelve sobre evaluaciones ya guardadas |
 | `--incluir-vacias` | abre también las que marcan progreso `0/0` |
-| `--headed` | con ventana visible |
+| `--headed` | con ventana visible (implica `--slow-mo 150`) |
+| `--headless` | sin ventana. Es el valor por defecto |
+| `--slow-mo <ms>` | ralentiza cada acción, sólo para observar |
+| `--ayuda` | muestra la ayuda |
 
 Es idempotente: las evaluaciones ya procesadas se saltan, así que volver a
-lanzarlo continúa donde iba.
+lanzarlo continúa donde iba. `--desde-pagina` sirve cuando se sabe dónde se
+cortó y no se quiere pagar el recorrido desde la primera página.
 
 ## Fase 2 — descarga de los PDF
 
+```bash
+node src/informes/main-informes.js [opciones]
+```
+
 | Opción | Qué hace |
 |--------|----------|
-| `--limite <n>` | descarga sólo n informes |
 | `--sesiones <n>` | sesiones en paralelo (por defecto 2) |
+| `--limite-eval <n>` | procesa sólo n evaluaciones |
 | `--destino <ruta>` | carpeta de salida (por defecto `./informes`) |
 | `--reintentar-errores` | vuelve sobre los que fallaron |
+| `--incluir-sin-respuestas` | incluye a quienes no tienen ningún evaluador finalizado. Su informe sale vacío: sólo para auditar |
+| `--headed` | con ventana visible |
+| `--ayuda` | muestra la ayuda |
 
 Cada informe se guarda como `<id>.pdf` junto a un `<id>.json` con el nombre, la
 cédula y la evaluación. El `id` es único por persona **y** evaluación, de modo
 que las N evaluaciones de una misma persona nunca se confunden.
 
-**Sobre `--sesiones`:** el servidor genera cada PDF en el momento de pedirlo y
-tarda entre dos y cuatro minutos, manteniendo tomado el lock de esa sesión. Dos
-peticiones sobre la misma sesión hacen cola en vez de ir en paralelo, así que el
-paralelismo se consigue con varias sesiones: cada worker hace su propio login y
-recibe su propia cookie. Funciona incluso con una sola credencial. Súbelo con
-cuidado y mirando los errores: es una aplicación de producción ajena.
+### Sobre `--sesiones`
+
+El servidor arma cada PDF en el momento de pedirlo y tarda unos 166 segundos,
+manteniendo tomado el lock de esa sesión mientras tanto. Dos peticiones sobre la
+misma sesión hacen cola en vez de ir en paralelo, así que el paralelismo se
+consigue con varias sesiones: cada worker abre la suya, recorre el listado por
+su cuenta y va reclamando las evaluaciones que nadie haya tomado. Funciona
+incluso con una sola credencial, porque lo que el servidor serializa es la
+sesión, no la cuenta.
+
+| Sesiones | Duración estimada |
+|----------|-------------------|
+| 2 | ~84 h |
+| 4 | ~42 h |
+| 6 | ~28 h |
+
+Súbelo con cuidado y mirando los errores. El `HTTP 500` que aparece de vez en
+cuando es transitorio —sale al pedir un informe mientras el servidor sigue
+ocupado con el anterior— y se reintenta solo, pero una racha de ellos significa
+que hay demasiadas sesiones encima.
+
+### Por qué la fase 2 vuelve a navegar
+
+Parece que bastaría con pedir por HTTP las URLs que cosechó la fase 1. No
+funciona: el servidor responde `200` y entrega un PDF válido, pero **vacío** —10
+páginas, sin un dato— salvo que la sesión tenga abierto el detalle de esa
+evaluación. Por eso la fase 2 recorre el listado otra vez y abre cada evaluación
+antes de pedir sus informes.
+
+Lo que sí conserva de la fase 1 es saber **a cuáles entrar y a quién le falta**,
+que es lo que evita abrir las ~980 evaluaciones para bajar unos pocos informes.
+
+### Los informes que se saltan por omisión
+
+Sin ningún evaluador en estado `Finalizada`, el servidor no tiene con qué armar
+el informe y devuelve ese mismo esqueleto de 10 páginas. La regla se verificó
+persona a persona sobre una evaluación completa: de ocho informes, el único
+vacío era el único con cero finalizados, y uno con apenas **1 de 9** salió
+completo. Basta uno.
+
+Son un 13% de las descargas —unas seis horas de las cuarenta y dos— para obtener
+archivos que se iban a descartar, así que se saltan. `--incluir-sin-respuestas`
+los recupera si hace falta auditarlos.
 
 ## Estructura de la colección `evaluaciones`
 
@@ -358,9 +454,14 @@ cuidado y mirando los errores: es una aplicación de producción ajena.
     nombre, cargo, email, area,
     documento: "52773406",
     matchPor: "email",                     // cómo se resolvió la cédula
-    informe: { id, group, cargo, url, estado, archivo, bytes },
+    informe: {
+      id, group, cargo, url,               // `id` nombra el archivo: <id>.pdf
+      estado: "descargado",                // pendiente | descargado | error | sin_url
+      archivo, bytes, paginas, intentos, ultimoError
+    },
     evaluadores: [{
-      relacion: "jefe",                    // autoevaluacion | jefe | par | subalterno
+      relacion: "jefe",                    // ver la tabla de abajo
+      iconoCrudo: "fas fa-arrow-up",       // el icono tal cual, por si aparece uno nuevo
       nombre, cargo,
       estado: "Finalizada",                // Finalizada | Iniciada | Pendiente
       documento, matchPor
@@ -371,6 +472,22 @@ cuidado y mirando los errores: es una aplicación de producción ajena.
   verificacion: { declaradosEnListado, leidosEnDetalle, coincide }
 }
 ```
+
+`relacion` sale del icono de la primera columna de la tabla de evaluadores: es la
+única pista que da la aplicación, no hay texto que lo diga.
+
+| Icono | `relacion` |
+|-------|-----------|
+| `fas fa-undo` | `autoevaluacion` |
+| `fas fa-arrow-up` | `jefe` |
+| `fas fa-arrow-right` | `par` |
+| `fas fa-arrow-down` | `subalterno` |
+| `fas fa-sync` | `cliente_interno` |
+
+Se guarda además `iconoCrudo` con la clase tal cual. Parece redundante y no lo
+es: `fa-sync` no estaba en la documentación de partida y apareció en 63
+evaluadores que quedaban sin relación. Tener el dato crudo permitió etiquetarlos
+con un `updateMany` en lugar de repetir dos horas de recorrido.
 
 `matchPor` dice cómo se llegó a cada cédula, y es tan importante como la cédula:
 permite auditar qué parte de los datos descansa sobre una coincidencia de nombre
@@ -402,6 +519,54 @@ eso se marcan como `ambiguo` en lugar de elegir una: la decisión es del humano.
 Los evaluadores no traen correo, sólo nombre. Como una misma persona aparece
 como evaluada en una evaluación y como evaluadora en otra, los evaluados ya
 resueltos alimentan un índice nombre→cédula que cubre a buena parte de ellos.
+
+## Verificar una corrida
+
+Esto es lo primero que hay que mirar al terminar, y conviene entender por qué.
+Al raspar una pantalla el error que arruina el trabajo no es el que explota
+—ése se ve— sino el que devuelve algo con la forma correcta y el contenido
+equivocado. Durante el desarrollo aparecieron seis fallos así, y **ninguno lanzó
+una excepción**: el programa informaba "0 errores" mientras guardaba
+evaluaciones con los datos de otra, perdía personas al paginar o bajaba PDF sin
+un dato dentro.
+
+Por eso cada capa guarda un número que el propio RPA no calcula. Estas cuatro
+consultas se pegan en el shell de Mongo, igual que las de la etapa 1:
+
+```js
+// 1. ¿Se leyeron tantos evaluados como declara la aplicación?
+//    Debe salir vacío. Cada resultado es un evaluado perdido o repetido.
+db.evaluaciones.find({ "verificacion.coincide": false },
+  { medicion: 1, progreso: 1, verificacion: 1, _id: 0 })
+
+// 2. ¿Cómo se resolvió cada cédula? Lo que salga como sin_match o ambiguo
+//    necesita una mirada humana, no un arreglo en el código.
+db.evaluaciones.aggregate([
+  { $unwind: "$evaluados" },
+  { $group: { _id: "$evaluados.matchPor", total: { $sum: 1 } } },
+  { $sort: { total: -1 } }
+])
+
+// 3. ¿Apareció algún icono de relación que no conocemos?
+//    Un null aquí es un tipo de evaluador nuevo, no un error.
+db.evaluaciones.aggregate([
+  { $unwind: "$evaluados" }, { $unwind: "$evaluados.evaluadores" },
+  { $match: { "evaluados.evaluadores.relacion": null } },
+  { $group: { _id: "$evaluados.evaluadores.iconoCrudo", total: { $sum: 1 } } }
+])
+
+// 4. Estado de las descargas
+db.evaluaciones.aggregate([
+  { $unwind: "$evaluados" },
+  { $match: { "evaluados.informe": { $ne: null } } },
+  { $group: { _id: "$evaluados.informe.estado", total: { $sum: 1 } } }
+])
+```
+
+El punto 3 no es teórico: así apareció `fas fa-sync`, una quinta relación que no
+estaba en la documentación de partida. Como la cosecha guarda `iconoCrudo` junto
+a la relación ya traducida, etiquetarla después costó un `updateMany` en vez de
+volver a recorrer la aplicación entera.
 
 ## Consultar los resultados
 
@@ -471,6 +636,31 @@ en 160 segundos. Interceptando `window.open` se guarda la URL sin navegar, y
 cada informe pasa a costar ~330 ms. Sobre ~4.200 informes, es la diferencia
 entre 187 horas y menos de media.
 
+Y una advertencia para quien intente simplificar la fase 2: **tener la URL no
+basta**. Pedirla desde una sesión limpia devuelve `200` y un PDF válido de 10
+páginas sin un dato dentro; hace falta que esa sesión tenga abierto el detalle
+de la evaluación. Comprobado aparte, la URL sí manda sobre de quién es el
+informe —pedir el de una persona tras pulsar el botón de otra devuelve
+igualmente el de la primera—, así que lo que la sesión aporta es el contexto de
+la evaluación, no la identidad.
+
+### Cómo se sabe si un PDF sirve
+
+Tres cosas distintas llegan con `HTTP 200` y firma `%PDF-` válida: el informe de
+verdad (37 a 42 páginas), el esqueleto vacío (exactamente 10) y la página de
+error de ASP.NET maquetada como PDF. **Comprobar la firma no alcanza**: doce
+archivos se dieron por buenos antes de detectarlo.
+
+Se distinguen por el número de páginas, que se cuenta sobre el binario sin
+librerías. Dos caminos que parecían más naturales no funcionan:
+
+- Buscar el título dentro del PDF. El informe y el esqueleto comparten la misma
+  plantilla incrustada: los dos contienen `REPORTE`, `360` y los mismos
+  identificadores de control.
+- Descomprimir los flujos y buscar ahí. El texto de un PDF va troceado por el
+  ajuste entre caracteres —`REPORTE` puede quedar como `(R) 1 (EPORTE)`—, así
+  que una búsqueda literal falla aunque el texto esté.
+
 ### Controles que nunca se pulsan
 
 El guard compara **por patrón**, no por id exacto, porque los controles de esta
@@ -496,7 +686,7 @@ por posición cae en uno o en otro según el estado de la fila.
 | `src/evaluaciones/detalle.js` | Evaluados, evaluadores y esperas de sincronización |
 | `src/evaluaciones/cosecha-urls.js` | Captura de las URLs de los informes |
 | `src/evaluaciones/match.js` | Resolución de cédulas contra `perfiles` |
-| `src/evaluaciones/mongo-eval.js` | Esquema `evaluaciones` y checkpoint |
+| `src/evaluaciones/mongo-eval.js` | Esquema `evaluaciones`, checkpoint y cola de informes pendientes |
 | `src/evaluaciones/main-eval.js` | CLI de la fase 1 |
-| `src/informes/descargador.js` | Sesiones paralelas y descarga verificada |
-| `src/informes/main-informes.js` | CLI de la fase 2 |
+| `src/informes/descargador.js` | Descarga y validación del PDF por número de páginas |
+| `src/informes/main-informes.js` | CLI de la fase 2: recorrido, reparto entre sesiones |
