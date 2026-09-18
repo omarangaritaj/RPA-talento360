@@ -198,7 +198,11 @@ export function guardarFalloEvaluacion(clave, fila, { estado, mensaje, paginaOri
  *
  * @param {{limite?:number, reintentarErrores?:boolean}} opciones
  */
-export async function informesPendientes({ limite = 0, reintentarErrores = false } = {}) {
+export async function informesPendientes({
+  limite = 0,
+  reintentarErrores = false,
+  incluirSinRespuestas = false,
+} = {}) {
   const estados = [ESTADOS_INFORME.pendiente];
   if (reintentarErrores) estados.push(ESTADOS_INFORME.error);
 
@@ -212,6 +216,30 @@ export async function informesPendientes({ limite = 0, reintentarErrores = false
       },
     },
     {
+      $addFields: {
+        evaluadoresFinalizados: {
+          $size: {
+            $filter: {
+              input: { $ifNull: ['$evaluados.evaluadores', []] },
+              as: 'e',
+              cond: { $eq: ['$$e.estado', 'Finalizada'] },
+            },
+          },
+        },
+      },
+    },
+    /**
+     * Sin ningún evaluador que haya terminado, el servidor no tiene con qué
+     * armar el informe y devuelve el esqueleto vacío de diez páginas. La
+     * correlación se verificó persona a persona: de ocho informes, el único que
+     * salió vacío era el único con cero evaluadores finalizados, y uno con
+     * apenas 1 de 9 salió completo. Basta uno.
+     *
+     * Descargarlos igualmente cuesta casi tres minutos cada uno para obtener un
+     * archivo que se va a descartar.
+     */
+    ...(incluirSinRespuestas ? [] : [{ $match: { evaluadoresFinalizados: { $gt: 0 } } }]),
+    {
       $project: {
         _id: 0,
         claveEvaluacion: 1,
@@ -222,6 +250,7 @@ export async function informesPendientes({ limite = 0, reintentarErrores = false
         nombre: '$evaluados.nombre',
         documento: '$evaluados.documento',
         intentos: '$evaluados.informe.intentos',
+        evaluadoresFinalizados: 1,
       },
     },
     ...(limite > 0 ? [{ $limit: limite }] : []),

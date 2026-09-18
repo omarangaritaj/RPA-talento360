@@ -56,12 +56,19 @@ export const PATRONES_PROHIBIDOS = [
 /**
  * Iconos de la primera columna de la tabla anidada de evaluadores.
  * Son la única pista del tipo de relación: no hay texto que lo diga.
+ *
+ * `fa-sync` no estaba en la documentación de partida; apareció al revisar los
+ * evaluadores que quedaban sin relación reconocida. Se comprobó que nunca es la
+ * misma persona que el evaluado —así que no es una autoevaluación—, que convive
+ * con los otros cuatro iconos en la misma tabla y que sus evaluadores responden
+ * como los demás.
  */
 export const RELACIONES = {
   'fa-undo': 'autoevaluacion',
   'fa-arrow-up': 'jefe',
   'fa-arrow-right': 'par',
   'fa-arrow-down': 'subalterno',
+  'fa-sync': 'cliente_interno',
 };
 
 /** Estados que la aplicación asigna a cada evaluador. */

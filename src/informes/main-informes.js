@@ -47,6 +47,8 @@ Etapa 2 · fase 2 — descarga de los informes PDF
   --sesiones <n>           sesiones en paralelo (por defecto 2)
   --destino <ruta>         carpeta de salida (por defecto ./informes)
   --reintentar-errores     vuelve sobre los que fallaron
+  --incluir-sin-respuestas incluye a quienes no tienen ningún evaluador
+                           finalizado. Su informe sale vacío: sólo para auditar
   --headed                 con ventana visible
   --ayuda                  esta ayuda
 
@@ -59,7 +61,16 @@ ASP.NET serializa las peticiones de una misma sesión.
 `;
 
 function leerArgumentos(argv) {
-  const o = { limiteEval: 0, sesiones: 2, destino: 'informes', reintentarErrores: false, headless: true };
+  const o = {
+    limiteEval: 0,
+    sesiones: 2,
+    destino: 'informes',
+    reintentarErrores: false,
+    // Por omisión se saltan los que no tienen ningún evaluador finalizado: el
+    // servidor devuelve para ellos un esqueleto vacío, y cuesta tres minutos.
+    incluirSinRespuestas: false,
+    headless: true,
+  };
 
   for (let i = 2; i < argv.length; i++) {
     const arg = argv[i];
@@ -69,6 +80,7 @@ function leerArgumentos(argv) {
     else if (arg === '--sesiones') o.sesiones = Math.max(1, Number(valor()));
     else if (arg === '--destino') o.destino = valor();
     else if (arg === '--reintentar-errores') o.reintentarErrores = true;
+    else if (arg === '--incluir-sin-respuestas') o.incluirSinRespuestas = true;
     else if (arg === '--headed') o.headless = false;
     else if (arg === '--ayuda' || arg === '-h') { console.log(AYUDA); process.exit(0); }
     else { console.error(`Opción desconocida: ${arg}\n${AYUDA}`); process.exit(1); }
@@ -134,7 +146,10 @@ async function principal() {
   await conectar();
   log('MongoDB conectado');
 
-  const pendientes = await informesPendientes({ reintentarErrores: opciones.reintentarErrores });
+  const pendientes = await informesPendientes({
+    reintentarErrores: opciones.reintentarErrores,
+    incluirSinRespuestas: opciones.incluirSinRespuestas,
+  });
   if (!pendientes.length) {
     console.log('No hay informes pendientes. Usa --reintentar-errores para volver sobre los fallidos.');
     console.log('Estado:', await resumenInformes());
@@ -155,6 +170,9 @@ async function principal() {
   const asignadas = new Set(objetivo);
 
   log(`Pendientes: ${pendientes.length} informes en ${claves.length} evaluación(es)`);
+  if (!opciones.incluirSinRespuestas) {
+    log('Se saltan los evaluados sin ningún evaluador finalizado: su informe sale vacío.');
+  }
   log(`A procesar: ${objetivo.length} evaluación(es) con ${opciones.sesiones} sesión(es)`);
   log('Cada informe tarda entre uno y tres minutos: el servidor lo arma al pedirlo.');
 
