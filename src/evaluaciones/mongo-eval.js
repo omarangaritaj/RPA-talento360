@@ -260,7 +260,7 @@ export async function informesPendientes({
 }
 
 /** Marca un informe como descargado. `informe.id` es único dentro de su evaluación. */
-export function marcarInformeDescargado(claveEvaluacion, id, { archivo, bytes }) {
+export function marcarInformeDescargado(claveEvaluacion, id, { archivo, bytes, paginas, ms }) {
   return Evaluacion.updateOne(
     { claveEvaluacion, 'evaluados.informe.id': id },
     {
@@ -268,6 +268,8 @@ export function marcarInformeDescargado(claveEvaluacion, id, { archivo, bytes })
         'evaluados.$.informe.estado': ESTADOS_INFORME.descargado,
         'evaluados.$.informe.archivo': archivo,
         'evaluados.$.informe.bytes': bytes,
+        'evaluados.$.informe.paginas': paginas ?? null,
+        'evaluados.$.informe.ms': ms ?? null,
         'evaluados.$.informe.descargadoEn': new Date(),
         'evaluados.$.informe.ultimoError': null,
       },
@@ -276,14 +278,33 @@ export function marcarInformeDescargado(claveEvaluacion, id, { archivo, bytes })
   );
 }
 
-/** Registra un fallo de descarga sin perder el resto del documento. */
-export function marcarInformeError(claveEvaluacion, id, mensaje) {
+/**
+ * Registra un fallo de descarga sin perder el resto del documento.
+ *
+ * Se guardan también las páginas, el peso y el tiempo que tardó, no sólo el
+ * mensaje. Cuando hubo que revisar si el filtro estaba rechazando informes
+ * buenos, el número de páginas hubo que sacarlo a mano del texto del mensaje y
+ * el peso y el tiempo no estaban por ninguna parte; eran las dos señales más
+ * baratas y las más útiles —el esqueleto vacío llega en dos segundos, un
+ * informe de verdad le cuesta minutos al servidor— y se habían tirado.
+ *
+ * @param {{mensaje:string, paginas?:number, bytes?:number, ms?:number, cuarentena?:string}} diagnostico
+ */
+export function marcarInformeError(claveEvaluacion, id, diagnostico) {
+  // Durante un tiempo esta función recibía sólo el mensaje: se acepta por
+  // compatibilidad para que una llamada vieja no guarde "[object Object]".
+  const d = typeof diagnostico === 'string' ? { mensaje: diagnostico } : (diagnostico ?? {});
+
   return Evaluacion.updateOne(
     { claveEvaluacion, 'evaluados.informe.id': id },
     {
       $set: {
         'evaluados.$.informe.estado': ESTADOS_INFORME.error,
-        'evaluados.$.informe.ultimoError': (mensaje ?? '').slice(0, 500),
+        'evaluados.$.informe.ultimoError': (d.mensaje ?? '').slice(0, 500),
+        'evaluados.$.informe.paginas': d.paginas ?? null,
+        'evaluados.$.informe.bytes': d.bytes ?? null,
+        'evaluados.$.informe.ms': d.ms ?? null,
+        'evaluados.$.informe.cuarentena': d.cuarentena ?? null,
       },
       $inc: { 'evaluados.$.informe.intentos': 1 },
     }

@@ -5,6 +5,7 @@
   "type": "module",
   "main": "src/main.js",
   "scripts": {
+    "test": "node --test pruebas/",
     "start": "node src/main.js",
     "prueba": "node src/main.js --limite 10 --headed --workers 1",
     "produccion": "node src/main.js --headless"
