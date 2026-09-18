@@ -44,7 +44,9 @@ const AYUDA = `
 Etapa 2 · fase 2 — descarga de los informes PDF
 
   --limite-eval <n>        procesa sólo n evaluaciones
-  --sesiones <n>           sesiones en paralelo (por defecto 2)
+  --sesiones <n>           sesiones en paralelo. Nunca más que cuentas haya en
+                           .env: dos sesiones sobre la misma cuenta se pisan el
+                           estado en el servidor y bajan informes VACÍOS
   --destino <ruta>         carpeta de salida (por defecto ./informes)
   --reintentar-errores     vuelve sobre los que fallaron
   --incluir-sin-respuestas incluye a quienes no tienen ningún evaluador
@@ -54,6 +56,14 @@ Etapa 2 · fase 2 — descarga de los informes PDF
 
 Cada PDF se guarda como <id>.pdf junto a un <id>.json con el nombre, la cédula
 y la evaluación. El id es único por persona y evaluación.
+
+Lo que no pasa la validación NO se tira: va a <destino>/cuarentena/ con un JSON
+que dice cuántas páginas traía, cuánto pesaba, cuánto tardó y por qué se
+rechazó. Revísalo de vez en cuando: es la única forma de enterarse de si el
+filtro está descartando informes buenos.
+
+La validación necesita pdftotext (paquete poppler-utils). Sin él se cae a una
+comprobación más burda y avisa por consola.
 
 Cada informe tarda entre uno y tres minutos: el servidor lo arma al pedirlo.
 El paralelismo sale de abrir varias sesiones, no de pedir varias cosas a la vez:
@@ -124,12 +134,23 @@ async function descargarEvaluacionAbierta(sesion, pendientesPorId, opciones, con
         await marcarInformeDescargado(pendiente.claveEvaluacion, url.id, {
           archivo: r.archivo,
           bytes: r.bytes,
+          paginas: r.paginas,
+          ms: r.ms,
         });
         contadores.ok++;
         contadores.bytes += r.bytes;
-        log(`    ✓ ${url.id} · ${quien} · ${(r.bytes / 1024).toFixed(0)} KB · ${seg}s`);
+        log(
+          `    ✓ ${url.id} · ${quien} · ${r.paginas} pág · ${(r.bytes / 1024).toFixed(0)} KB · ${seg}s` +
+            (r.dudoso ? ' · DUDOSO, revísalo' : '')
+        );
       } else {
-        await marcarInformeError(pendiente.claveEvaluacion, url.id, r.motivo);
+        await marcarInformeError(pendiente.claveEvaluacion, url.id, {
+          mensaje: r.motivo,
+          paginas: r.paginas,
+          bytes: r.bytes,
+          ms: r.ms,
+          cuarentena: r.cuarentena,
+        });
         contadores.errores++;
         log(`    ✗ ${url.id} · ${quien} · ${r.motivo} · ${seg}s`);
       }
@@ -141,7 +162,31 @@ async function descargarEvaluacionAbierta(sesion, pendientesPorId, opciones, con
 
 async function principal() {
   const opciones = leerArgumentos(process.argv);
-  const [credencial] = leerCredenciales();
+
+  /**
+   * Una cuenta por sesión, sin excepción.
+   *
+   * Cada worker abre su propio contexto de navegador, así que tiene su propia
+   * cookie y su propio SessionID… y aun así dos workers sobre la MISMA cuenta
+   * se estorban: el estado que hace falta para que el servidor arme el informe
+   * —qué evaluación está abierta y de quién se pidió el informe— vive del lado
+   * del servidor, atado a la cuenta, no a la cookie.
+   *
+   * El síntoma no es un error, que sería fácil: es que el informe llega vacío.
+   * Con dos workers sobre una sola cuenta, 25 de 28 descargas devolvieron el
+   * esqueleto de diez páginas; el mismo flujo con una sola sesión los devolvía
+   * completos. Pedir más sesiones que cuentas hay no acelera nada: multiplica
+   * los informes vacíos y cuesta dos minutos de servidor cada uno.
+   */
+  const credenciales = leerCredenciales();
+  if (opciones.sesiones > credenciales.length) {
+    log(
+      `AVISO: pediste ${opciones.sesiones} sesión(es) pero en .env hay ${credenciales.length} ` +
+        `cuenta(s). Se usa ${credenciales.length}: compartir cuenta entre sesiones hace que ` +
+        `el servidor devuelva informes VACÍOS. Define USER_2/PASSWORD_2 para ir en paralelo.`
+    );
+    opciones.sesiones = credenciales.length;
+  }
 
   await conectar();
   log('MongoDB conectado');
@@ -190,12 +235,14 @@ async function principal() {
    * evita tener que repartirlas de antemano sin saber cuánto tarda cada una.
    */
   async function worker(indice) {
+    // Una cuenta distinta por worker: ver el comentario en `principal`.
+    const credencial = credenciales[indice - 1];
     const sesion = new SesionEvaluaciones(credencial, { headless: opciones.headless });
     try {
       await sesion.abrir();
       await sesion.login();
       await abrirListado(sesion);
-      log(`[worker-${indice}] sesión lista`);
+      log(`[worker-${indice}] sesión lista como ${credencial.usuario}`);
 
       for (let vuelta = 0; vuelta < MAX_PAGINAS; vuelta++) {
         const pagina = await paginaActual(sesion.page);

@@ -344,9 +344,12 @@ db.evaluaciones.find({ "verificacion.coincide": false })
 node src/informes/main-informes.js --limite-eval 1
 ```
 
-**Paso 5 — la descarga completa.** Unas 42 horas con 4 sesiones. Empieza en 4,
-mira la tasa de error de los primeros informes y sube sólo si va limpio: es una
-aplicación de producción ajena.
+**Paso 5 — la descarga completa.** Unas 42 horas con 4 sesiones, pero **cada
+sesión necesita su propia cuenta en `.env`** (`USER_1`…`USER_4`): dos sesiones
+sobre la misma cuenta bajan informes vacíos, ver
+[Sobre `--sesiones`](#sobre---sesiones-una-cuenta-por-sesión-sin-excepción).
+Empieza bajo, mira la tasa de error de los primeros informes y sube sólo si va
+limpio: es una aplicación de producción ajena.
 
 ```bash
 node src/informes/main-informes.js --sesiones 4
@@ -385,7 +388,7 @@ node src/informes/main-informes.js [opciones]
 
 | Opción | Qué hace |
 |--------|----------|
-| `--sesiones <n>` | sesiones en paralelo (por defecto 2) |
+| `--sesiones <n>` | sesiones en paralelo. **Nunca más que cuentas haya en `.env`** |
 | `--limite-eval <n>` | procesa sólo n evaluaciones |
 | `--destino <ruta>` | carpeta de salida (por defecto `./informes`) |
 | `--reintentar-errores` | vuelve sobre los que fallaron |
@@ -397,26 +400,109 @@ Cada informe se guarda como `<id>.pdf` junto a un `<id>.json` con el nombre, la
 cédula y la evaluación. El `id` es único por persona **y** evaluación, de modo
 que las N evaluaciones de una misma persona nunca se confunden.
 
-### Sobre `--sesiones`
+### Sobre `--sesiones`: **una cuenta por sesión, sin excepción**
 
 El servidor arma cada PDF en el momento de pedirlo y tarda unos 166 segundos,
 manteniendo tomado el lock de esa sesión mientras tanto. Dos peticiones sobre la
 misma sesión hacen cola en vez de ir en paralelo, así que el paralelismo se
 consigue con varias sesiones: cada worker abre la suya, recorre el listado por
-su cuenta y va reclamando las evaluaciones que nadie haya tomado. Funciona
-incluso con una sola credencial, porque lo que el servidor serializa es la
-sesión, no la cuenta.
+su cuenta y va reclamando las evaluaciones que nadie haya tomado.
 
-| Sesiones | Duración estimada |
-|----------|-------------------|
-| 2 | ~84 h |
-| 4 | ~42 h |
-| 6 | ~28 h |
+Pero **cada sesión necesita su propia cuenta**. Aquí decía antes lo contrario
+—que bastaba una credencial porque lo serializado era la sesión y no la cuenta—
+y costó una corrida entera: con dos workers sobre una sola cuenta, **25 de 28
+descargas devolvieron el esqueleto vacío**. Cada worker abre su propio
+navegador y tiene su propia cookie, así que el aislamiento *parece* correcto y
+no lo es: el estado que el servidor necesita para armar el informe —qué
+evaluación está abierta y de quién se pidió el informe— vive del lado del
+servidor y va atado a la cuenta.
+
+Y el síntoma no es un error, que sería fácil de ver: es un PDF perfectamente
+válido y vacío, después de dos minutos de espera. El programa ahora recorta
+`--sesiones` al número de cuentas que haya en `.env` y avisa por consola.
+
+| Cuentas en `.env` | Sesiones | Duración estimada |
+|-------------------|----------|-------------------|
+| 1 | 1 | ~166 h |
+| 2 | 2 | ~84 h |
+| 4 | 4 | ~42 h |
+| 6 | 6 | ~28 h |
 
 Súbelo con cuidado y mirando los errores. El `HTTP 500` que aparece de vez en
 cuando es transitorio —sale al pedir un informe mientras el servidor sigue
 ocupado con el anterior— y se reintenta solo, pero una racha de ellos significa
 que hay demasiadas sesiones encima.
+
+### Qué se considera un informe válido
+
+Tres cosas distintas llegan con `HTTP 200` y firma `%PDF-` correcta: el informe
+de verdad, un **esqueleto vacío** de 10 páginas y 109 KB, y la página de error
+de ASP.NET maquetada como PDF. Se distinguen extrayendo el texto con
+`pdftotext` y buscando dentro el **nombre del evaluado**: aparece en los 13 de
+13 informes reales comprobados, y cero veces en el esqueleto. Valida contenido
+e identidad de una vez.
+
+> Requiere `pdftotext`, del paquete `poppler-utils`. Sin él se cae a una
+> comprobación más burda y avisa por consola:
+> `sudo apt install poppler-utils`
+
+**Contar páginas no sirve para rechazar**, aunque lo parezca. Se probó con un
+mínimo de 20 y tiró informes reales: el número de páginas depende de cuántos
+evaluadores respondieron, y el más corto observado bajó de 37 a 23 según
+aparecieron evaluaciones pequeñas. No hay umbral bueno.
+
+#### La cuarta respuesta: el informe truncado
+
+Hay una más, y se descubrió tarde. Cuando otra sesión de la misma cuenta le
+pisa el estado al servidor mientras está armando el PDF, éste entrega **lo que
+lleva hecho**. El caso que lo destapó llegó con 15 páginas; repetido con una
+sola sesión, el mismo informe bajó con **42**.
+
+Un truncado lleva el nombre del evaluado en la portada, así que pasa la
+comprobación del texto igual que uno entero. Lo único que lo delata es que
+viene corto — y el número de páginas ya vimos que es señal malísima para
+rechazar. De ahí la asimetría, que es el punto entero:
+
+> **El número de páginas sirve para SOSPECHAR, nunca para DESCARTAR.**
+
+Por debajo de 20 páginas el informe se guarda igual, se marca `dudoso` en su
+JSON y se canta en el log. Nadie decide por ti que ese archivo no vale; se te
+avisa para que lo mires.
+
+La causa de fondo son las sesiones compartiendo cuenta, así que con `.env` bien
+puesto no deberían aparecer. Si aparecen, es la señal de que algo volvió a
+pisarse.
+
+### La cuarentena
+
+Lo que no pasa la validación **no se tira**: va a `informes/cuarentena/` con un
+JSON que dice cuántas páginas traía, cuánto pesaba, cuánto tardó el servidor y
+por qué se rechazó.
+
+No es celo de archivero. La primera versión de este filtro borraba lo que
+descartaba, y cuando hubo que revisar si se estaban perdiendo informes buenos
+—se estaban perdiendo— no quedaba un solo archivo que mirar. Un filtro que
+decide qué datos son buenos y destruye lo que descarta no se puede auditar
+jamás. Revísala de vez en cuando: es la única forma de enterarse.
+
+Para ver qué hay dentro y por qué:
+
+```bash
+node src/informes/revisar-cuarentena.js --detalle
+```
+
+Agrupa por motivo y destaca lo que no encaja con ningún patrón conocido, que es
+justo lo que hay que mirar a mano. **Si encuentras uno que el validador rechazó
+mal, ese archivo es el caso de prueba que le falta** — mételo en `pruebas/` antes
+de tocar el criterio.
+
+El validador tiene su propio banco de pruebas, que corre contra archivos
+guardados en vez de contra el servidor. Segundos en vez de los tres minutos que
+cuesta cada intento contra la aplicación:
+
+```bash
+npm test
+```
 
 ### Por qué la fase 2 vuelve a navegar
 
@@ -688,5 +774,10 @@ por posición cae en uno o en otro según el estado de la fila.
 | `src/evaluaciones/match.js` | Resolución de cédulas contra `perfiles` |
 | `src/evaluaciones/mongo-eval.js` | Esquema `evaluaciones`, checkpoint y cola de informes pendientes |
 | `src/evaluaciones/main-eval.js` | CLI de la fase 1 |
-| `src/informes/descargador.js` | Descarga y validación del PDF por número de páginas |
+| `src/informes/descargador.js` | Descarga del PDF, reintentos y cuarentena |
+| `src/informes/validador.js` | Decide si un PDF es el informe de esa persona |
+| `src/informes/revisar-cuarentena.js` | Qué hay en la cuarentena y por qué |
 | `src/informes/main-informes.js` | CLI de la fase 2: recorrido, reparto entre sesiones |
+| `pruebas/validador.test.mjs` | Banco de pruebas del validador, contra archivos |
+| `pruebas/descargador.test.mjs` | Que lo rechazado acabe en cuarentena y no se pierda |
+| `pruebas/muestras/` | Esqueletos vacíos de referencia. Plantilla pura, sin datos de nadie |
