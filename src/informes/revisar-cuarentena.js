@@ -20,36 +20,98 @@
  *   · cualquier otra cosa → mírala de verdad, y si el validador se equivocó,
  *     ese archivo es el caso de prueba que le faltaba a `pruebas/`.
  */
-import { readdir, readFile } from 'node:fs/promises';
+import { readdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { CARPETA_CUARENTENA } from './descargador.js';
+import { validarInforme } from './validador.js';
 
 const AYUDA = `
 Revisión de la cuarentena de informes
 
   --destino <ruta>   carpeta de salida usada al descargar (por defecto ./informes)
   --detalle          lista cada archivo, no sólo el resumen
+  --revalidar        vuelve a pasar cada PDF por el validador ACTUAL y reescribe
+                     su diagnóstico. Úsalo después de tocar el validador: si
+                     alguno pasa a válido, se recupera sin volver a pedírselo al
+                     servidor, que son dos minutos por archivo
   --ayuda            esta ayuda
 `;
 
 function leerArgumentos(argv) {
-  const o = { destino: 'informes', detalle: false };
+  const o = { destino: 'informes', detalle: false, revalidar: false };
   for (let i = 2; i < argv.length; i++) {
     if (argv[i] === '--destino') o.destino = argv[++i];
     else if (argv[i] === '--detalle') o.detalle = true;
+    else if (argv[i] === '--revalidar') o.revalidar = true;
     else if (argv[i] === '--ayuda' || argv[i] === '-h') { console.log(AYUDA); process.exit(0); }
     else { console.error(`Opción desconocida: ${argv[i]}\n${AYUDA}`); process.exit(1); }
   }
   return o;
 }
 
-/** Los tres patrones conocidos. Lo que no cae en ninguno hay que mirarlo. */
+/**
+ * Pasa cada PDF por el validador actual y actualiza su diagnóstico.
+ *
+ * La razón de existir: el motivo guardado envejece. Once páginas de error
+ * quedaron archivadas como "esqueleto vacío" por un fallo del validador que se
+ * corrigió después, y sin esto seguirían mintiendo para siempre en su JSON.
+ *
+ * Y lo que de verdad importa: si el validador mejora y alguno de los
+ * rechazados pasa a válido, se recupera desde el disco. Volver a pedirlo al
+ * servidor cuesta dos minutos y puede devolver otra cosa distinta.
+ */
+async function revalidar(carpeta, metadatos) {
+  const recuperables = [];
+
+  for (const meta of metadatos) {
+    let cuerpo;
+    try {
+      cuerpo = await readFile(join(carpeta, `${meta.id}.pdf`));
+    } catch {
+      continue; // un JSON sin su PDF no se puede revalidar
+    }
+
+    const r = await validarInforme(cuerpo, { nombre: meta.nombre });
+    meta.rechazadoPor = r.motivo ?? (r.valido ? 'AHORA SE CONSIDERA VÁLIDO' : 'sin motivo');
+    meta.paginas = r.paginas;
+    meta.revalidadoEn = new Date().toISOString();
+    if (r.valido) {
+      meta.ahoraValido = true;
+      recuperables.push(meta);
+    }
+
+    await writeFile(join(carpeta, `${meta.id}.json`), JSON.stringify(meta, null, 2));
+  }
+
+  return recuperables;
+}
+
+/**
+ * Clasifica por el MOTIVO, no por el tamaño.
+ *
+ * La primera versión clasificaba por número de páginas y se equivocaba de
+ * lleno: llamaba "posible informe truncado" a cuatro esqueletos de 42 páginas,
+ * que de truncados no tenían nada —eran la plantilla entera sin un dato
+ * dentro— y metía once páginas de error de ASP.NET en el cajón de "sin
+ * clasificar". El tamaño no dice qué es un archivo. El motivo sí, ahora que el
+ * validador lo escribe con precisión.
+ */
 function clasificar(meta) {
-  if (/no es un PDF/i.test(meta.rechazadoPor ?? '')) return 'no era un PDF';
-  if (/error de la aplicación/i.test(meta.rechazadoPor ?? '')) return 'página de error de ASP.NET';
-  if (meta.paginas === 10 && meta.bytes < 150 * 1024) return 'esqueleto vacío (10 pág)';
-  if (meta.paginas > 10) return 'POSIBLE INFORME TRUNCADO — revísalo';
+  const motivo = meta.rechazadoPor ?? '';
+
+  if (/no es un PDF/i.test(motivo)) return 'no era un PDF';
+  if (/error de la aplicación/i.test(motivo)) return 'página de error de ASP.NET';
+  if (/podría estar truncado/i.test(motivo)) return 'POSIBLE TRUNCADO — revísalo';
+  if (/podría ser de OTRA persona/i.test(motivo)) return 'INFORME ARMADO DE OTRA PERSONA — revísalo';
+  if (/esqueleto|título del esqueleto/i.test(motivo)) {
+    // Los dos tamaños del esqueleto se separan porque significan cosas
+    // distintas: el pequeño es la respuesta a una sesión sin estado; el
+    // grande, la plantilla entera sin datos. Confundirlos despista.
+    return meta.paginas > 20
+      ? 'esqueleto GRANDE: plantilla entera sin datos'
+      : 'esqueleto vacío (10 pág)';
+  }
   return 'SIN CLASIFICAR — revísalo';
 }
 
@@ -70,15 +132,24 @@ async function principal() {
     return;
   }
 
-  const porClase = new Map();
+  const metadatos = [];
   for (const archivo of archivos) {
-    let meta;
     try {
-      meta = JSON.parse(await readFile(join(carpeta, archivo), 'utf8'));
+      metadatos.push(JSON.parse(await readFile(join(carpeta, archivo), 'utf8')));
     } catch {
-      continue; // un JSON ilegible no debe tumbar el informe entero
+      // un JSON ilegible no debe tumbar el informe entero
     }
-    const clase = clasificar(meta);
+  }
+
+  let recuperables = [];
+  if (opciones.revalidar) {
+    console.log(`Revalidando ${metadatos.length} archivo(s) con el validador actual…`);
+    recuperables = await revalidar(carpeta, metadatos);
+  }
+
+  const porClase = new Map();
+  for (const meta of metadatos) {
+    const clase = meta.ahoraValido ? 'RECUPERABLE — ahora pasa la validación' : clasificar(meta);
     if (!porClase.has(clase)) porClase.set(clase, []);
     porClase.get(clase).push(meta);
   }
@@ -86,15 +157,14 @@ async function principal() {
   console.log(`\nCuarentena de ${carpeta} · ${archivos.length} archivo(s)\n`);
 
   // Lo que hay que mirar primero va primero.
-  const orden = [...porClase.keys()].sort((a, b) =>
-    Number(b.includes('revísalo')) - Number(a.includes('revísalo'))
-  );
+  const prioridad = (c) => Number(c.includes('RECUPERABLE')) * 2 + Number(c.includes('revísalo'));
+  const orden = [...porClase.keys()].sort((a, b) => prioridad(b) - prioridad(a));
 
   for (const clase of orden) {
     const casos = porClase.get(clase);
     console.log(`${String(casos.length).padStart(4)} · ${clase}`);
 
-    if (opciones.detalle || clase.includes('revísalo')) {
+    if (opciones.detalle || clase.includes('revísalo') || clase.includes('RECUPERABLE')) {
       for (const meta of casos) {
         console.log(
           `       ${meta.id} · ${meta.nombre ?? 'sin nombre'} · ${meta.paginas ?? '?'} pág · ` +
@@ -102,6 +172,14 @@ async function principal() {
         );
       }
     }
+  }
+
+  if (recuperables.length) {
+    console.log(
+      `\n${recuperables.length} archivo(s) pasan ahora la validación. Están en disco: ` +
+        'muévelos a la carpeta de informes en vez de volver a pedirlos al servidor,\n' +
+        'que son dos minutos cada uno y puede devolver otra cosa.'
+    );
   }
 
   const sospechosos = orden.filter((c) => c.includes('revísalo'));

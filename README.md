@@ -389,6 +389,8 @@ node src/informes/main-informes.js [opciones]
 | Opción | Qué hace |
 |--------|----------|
 | `--sesiones <n>` | sesiones en paralelo. **Nunca más que cuentas haya en `.env`** |
+| `--solo-cerradas` | sólo informes de evaluaciones `CERRADA` |
+| `--estado-eval <valor>` | filtra por un estado concreto (`CERRADA` o `ABIERTA`) |
 | `--limite-eval <n>` | procesa sólo n evaluaciones |
 | `--destino <ruta>` | carpeta de salida (por defecto `./informes`) |
 | `--reintentar-errores` | vuelve sobre los que fallaron |
@@ -433,14 +435,45 @@ cuando es transitorio —sale al pedir un informe mientras el servidor sigue
 ocupado con el anterior— y se reintenta solo, pero una racha de ellos significa
 que hay demasiadas sesiones encima.
 
+### Descargar sólo las evaluaciones cerradas
+
+```bash
+node src/informes/main-informes.js --solo-cerradas --sesiones 1
+```
+
+Una evaluación `ABIERTA` todavía puede recibir respuestas, así que su informe
+cambiará: bajarlo hoy es pagar tres minutos de servidor por un dato que caduca.
+Las `CERRADA` son definitivas.
+
+| Estado | Evaluaciones | Informes pendientes |
+|--------|--------------|---------------------|
+| `CERRADA` | 582 | 3.212 |
+| `ABIERTA` | 371 | 1.359 |
+
+`--estado-eval <valor>` hace lo mismo con cualquier estado y no distingue
+mayúsculas (`--estado-eval abierta` funciona). Si el estado que pides no existe
+—porque la aplicación cambió el texto de la celda, que es de donde se raspa— el
+programa **no** se calla diciendo que no hay nada pendiente: avisa de que ese
+estado no existe y lista los que sí.
+
 ### Qué se considera un informe válido
 
-Tres cosas distintas llegan con `HTTP 200` y firma `%PDF-` correcta: el informe
-de verdad, un **esqueleto vacío** de 10 páginas y 109 KB, y la página de error
-de ASP.NET maquetada como PDF. Se distinguen extrayendo el texto con
-`pdftotext` y buscando dentro el **nombre del evaluado**: aparece en los 13 de
-13 informes reales comprobados, y cero veces en el esqueleto. Valida contenido
-e identidad de una vez.
+**Cuatro** cosas distintas llegan con `HTTP 200` y firma `%PDF-` correcta:
+
+| Qué es | Título | Tamaño |
+|--------|--------|--------|
+| El informe de verdad | `REPORTE EVALUACIÓN 360 DE DESEMPEÑO` + nombre y cargo | 23-42 pág |
+| Esqueleto vacío | `REPORTE DE DESEMPEÑO`, sin nombre | 10 pág, 109 KB |
+| **Esqueleto grande** | `REPORTE DE DESEMPEÑO`, sin nombre | **42 pág, 736 KB** |
+| Página de error de ASP.NET | — | 1 pág, ~170 KB |
+
+Se distinguen extrayendo el texto con `pdftotext` y buscando dentro el **nombre
+del evaluado**: aparece en los 219 informes reales descargados y en ninguno de
+los 15 que no lo son. Valida contenido e identidad de una vez.
+
+Ojo con el tercero, que es el que engaña: trae la plantilla entera —escalas,
+definiciones, los marcos de todos los gráficos— y pesa 736 KB **sin un solo
+dato de nadie**. Cualquier criterio basado en el tamaño lo daría por bueno.
 
 > Requiere `pdftotext`, del paquete `poppler-utils`. Sin él se cae a una
 > comprobación más burda y avisa por consola:
@@ -494,7 +527,20 @@ node src/informes/revisar-cuarentena.js --detalle
 Agrupa por motivo y destaca lo que no encaja con ningún patrón conocido, que es
 justo lo que hay que mirar a mano. **Si encuentras uno que el validador rechazó
 mal, ese archivo es el caso de prueba que le falta** — mételo en `pruebas/` antes
-de tocar el criterio.
+de tocar el criterio. Así entraron las muestras del esqueleto grande y de la
+página de error: las dos salieron de aquí.
+
+Y después de tocar el validador:
+
+```bash
+node src/informes/revisar-cuarentena.js --revalidar
+```
+
+Vuelve a pasar cada PDF por el validador actual y reescribe su diagnóstico. Si
+alguno pasa a válido, **se recupera desde el disco**: volver a pedírselo al
+servidor cuesta dos minutos y puede devolver otra cosa distinta. Sirvió para
+reclasificar nueve páginas de error que estaban archivadas como "esqueleto
+vacío" por un fallo del validador que se corrigió después.
 
 El validador tiene su propio banco de pruebas, que corre contra archivos
 guardados en vez de contra el servidor. Segundos en vez de los tres minutos que

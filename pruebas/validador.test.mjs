@@ -106,6 +106,47 @@ describe('validarInforme · rechaza lo que debe rechazar', () => {
     });
   }
 
+  /**
+   * EL ESQUELETO GRANDE — el caso que ningún criterio de tamaño detecta.
+   *
+   * 42 páginas y 736 KB, la plantilla entera con sus escalas y los marcos de
+   * todos los gráficos… y sin un dato de nadie. Se titula "REPORTE DE
+   * DESEMPEÑO" en vez de "REPORTE EVALUACIÓN 360 DE DESEMPEÑO" y donde iría el
+   * nombre no hay nada.
+   *
+   * Es la prueba de que el número de páginas no vale ni para aceptar: este
+   * archivo supera cualquier umbral que se quiera poner.
+   */
+  test('el esqueleto GRANDE de 42 páginas, que supera cualquier umbral', async () => {
+    const cuerpo = await readFile(join(MUESTRAS, 'esqueleto-grande-42pag.pdf'));
+
+    assert.ok(contarPaginas(cuerpo) > 40, 'la muestra debe ser grande, si no no prueba nada');
+    assert.ok(cuerpo.length > 700 * 1024, 'y pesada');
+
+    const r = await validarInforme(cuerpo, { nombre: 'RICARDO FRANCO RIOS' });
+    assert.equal(r.valido, false, 'no lleva el nombre: no es el informe de nadie');
+    assert.match(r.motivo, /esqueleto/i);
+  });
+
+  /**
+   * La página de error de ASP.NET real, tal como llegó del servidor.
+   *
+   * Once de éstas entraron en cuarentena diagnosticadas como "esqueleto
+   * vacío", porque la marca de error se buscaba sólo sobre el binario y aquí
+   * el texto viaja comprimido. El rechazo era correcto; el motivo escrito, no.
+   */
+  test('la página de error de ASP.NET, con el texto comprimido', async () => {
+    const cuerpo = await readFile(join(MUESTRAS, 'pagina-error-aspnet.pdf'));
+
+    const r = await validarInforme(cuerpo, { nombre: 'ENRIQUE ALFONSO CRUZ BARRERA' });
+    assert.equal(r.valido, false);
+    assert.match(
+      r.motivo,
+      /error de la aplicación/i,
+      'debe reconocerse como error, no confundirse con el esqueleto'
+    );
+  });
+
   test('un informe de otra persona: la identidad también se valida', async () => {
     const casos = await informesReales();
     if (!casos.length) return; // sin muestras locales

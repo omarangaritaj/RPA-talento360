@@ -4,17 +4,21 @@
  * Vive aparte del descargador porque decidir qué datos son buenos tiene su
  * propia complejidad y merece su propio banco de pruebas: `pruebas/validador.test.mjs`.
  *
- * TRES COSAS DISTINTAS LLEGAN CON HTTP 200 Y FIRMA `%PDF-` VÁLIDA
+ * CUATRO COSAS DISTINTAS LLEGAN CON HTTP 200 Y FIRMA `%PDF-` VÁLIDA
  *
- *   1. El informe de verdad. Entre 23 y 42 páginas, de 350 KB a 900 KB. Lleva
- *      "ASOCIACION SCOUTS DE COLOMBIA" en la cabecera y el nombre del evaluado
- *      dos veces.
- *   2. El esqueleto vacío: exactamente 10 páginas y 109 KB, siempre idéntico.
- *      Es lo que devuelve el servidor cuando la sesión no tiene abierto el
- *      detalle de la evaluación. Comparte plantilla con el informe real, así
- *      que trae "REPORTE", "Competencia" y "Promedio" igual que él; lo que no
- *      trae es un solo dato de nadie.
- *   3. La página de error de ASP.NET maquetada como PDF.
+ *   1. El informe de verdad. Entre 23 y 42 páginas, de 350 KB a 900 KB. Se
+ *      titula "REPORTE EVALUACIÓN 360 DE DESEMPEÑO" y debajo van el nombre del
+ *      evaluado, su cargo y su área. El nombre aparece dos veces.
+ *   2. El esqueleto vacío pequeño: 10 páginas y 109 KB. Es lo que devuelve el
+ *      servidor cuando la sesión no tiene el estado que hace falta.
+ *   3. EL ESQUELETO GRANDE, que es el que engaña. Trae la plantilla entera
+ *      —definiciones, escalas, los marcos de todos los gráficos— y llega a 42
+ *      páginas y 736 KB, pero sin un solo dato de nadie: se titula "REPORTE DE
+ *      DESEMPEÑO" y donde debería ir el nombre no hay nada. Cuatro de éstos
+ *      aparecieron en cuarentena. Cualquier criterio basado en el tamaño los
+ *      habría dado por buenos.
+ *   4. La página de error de ASP.NET maquetada como PDF: una página, ~170 KB,
+ *      con "Column 'Promedio' does not belong to table" dentro.
  *
  * CÓMO SE DISTINGUEN — Y LOS DOS CAMINOS QUE NO FUNCIONAN
  *
@@ -47,17 +51,34 @@ import { execFile } from 'node:child_process';
 const FIRMA_PDF = '%PDF-';
 
 /**
- * Rastro de la página de error de ASP.NET. Va en claro dentro del PDF, así que
- * se busca sobre el binario sin más.
+ * Rastro de la página de error de ASP.NET.
+ *
+ * Se busca DOS VECES: sobre el binario y, después, sobre el texto extraído.
+ * No sobra ninguna de las dos. A veces el texto viaja en claro dentro del PDF
+ * y el binario basta; otras va comprimido y la búsqueda binaria no lo ve. Once
+ * páginas de error entraron en cuarentena diagnosticadas como "esqueleto
+ * vacío" por confiar sólo en el binario —el rechazo era correcto, el motivo
+ * escrito era falso— y un motivo equivocado lleva a la decisión equivocada
+ * cuando alguien lo lea dentro de tres semanas.
  */
 const MARCA_ERROR = /Server Error in|Exception Details|does not belong to table/i;
 
 /**
- * Cabecera que sólo aparece cuando el servidor armó el informe con datos. El
- * esqueleto empieza directamente por "DIRECCIÓN NACIONAL DE ADULTOS".
- * Es la red de seguridad para cuando no sabemos de quién debería ser el PDF.
+ * El título, que es lo único que distingue las dos plantillas.
+ *
+ *   informe con datos → "REPORTE EVALUACIÓN 360 DE DESEMPEÑO", y debajo el
+ *                        nombre de la persona, su cargo y su área
+ *   esqueleto         → "REPORTE DE DESEMPEÑO", y debajo nada
+ *
+ * Medido sobre 236 archivos: aparece en los 219 informes válidos y en cero de
+ * los 17 que no lo son. Separación limpia.
+ *
+ * NO sirve la cabecera "ASOCIACION SCOUTS DE COLOMBIA", que fue el primer
+ * candidato: la traen también esqueletos de 42 páginas —ver la nota sobre el
+ * esqueleto grande más abajo— así que daba por buenos archivos sin un dato
+ * dentro.
  */
-const MARCADOR_CABECERA = 'ASOCIACION SCOUTS DE COLOMBIA';
+const MARCADOR_INFORME = 'REPORTE EVALUACIÓN';
 
 /** Páginas y peso del esqueleto vacío, medidos sobre dos muestras idénticas. */
 const ESQUELETO = { paginas: 10, bytesMaximos: 150 * 1024 };
@@ -197,6 +218,12 @@ export async function validarInforme(cuerpo, { nombre } = {}) {
     return porFirmaDelEsqueleto(cuerpo, paginas);
   }
 
+  // Segunda pasada de la marca de error, ahora sobre el texto ya reconstruido:
+  // ver el comentario de MARCA_ERROR.
+  if (MARCA_ERROR.test(texto)) {
+    return { valido: false, paginas, motivo: 'el PDF contiene una página de error de la aplicación' };
+  }
+
   const contenido = normalizar(texto);
   const buscado = normalizar(nombre);
 
@@ -215,14 +242,16 @@ export async function validarInforme(cuerpo, { nombre } = {}) {
     return { valido: true, paginas };
   }
 
-  // Sin nombre de referencia sólo queda preguntar si el informe trae datos de
-  // alguien. Sirve para diagnosticar a mano un PDF suelto, no para la corrida.
+  const esInformeArmado = contenido.includes(normalizar(MARCADOR_INFORME));
+
+  // Sin nombre de referencia sólo queda preguntar si el PDF es un informe
+  // armado. Sirve para diagnosticar a mano un PDF suelto, no para la corrida.
   if (!buscado) {
-    if (contenido.includes(normalizar(MARCADOR_CABECERA))) return { valido: true, paginas };
+    if (esInformeArmado) return { valido: true, paginas };
     return {
       valido: false,
       paginas,
-      motivo: 'el PDF no lleva la cabecera de un informe con datos: es el esqueleto vacío',
+      motivo: 'el PDF lleva el título del esqueleto ("REPORTE DE DESEMPEÑO"), no el del informe',
     };
   }
 
@@ -232,8 +261,8 @@ export async function validarInforme(cuerpo, { nombre } = {}) {
     motivo:
       `el PDF no contiene el nombre del evaluado ("${nombre}"), así que no es su informe: ` +
       `${paginas} página(s), ${(cuerpo.length / 1024).toFixed(0)} KB` +
-      (contenido.includes(normalizar(MARCADOR_CABECERA))
-        ? '. Lleva cabecera de informe con datos: podría ser de OTRA persona, revísalo en cuarentena'
-        : '. Es el esqueleto vacío'),
+      (esInformeArmado
+        ? '. Lleva el título de un informe armado, así que podría ser de OTRA persona: revísalo'
+        : '. Lleva el título del esqueleto ("REPORTE DE DESEMPEÑO"): es el esqueleto vacío'),
   };
 }
