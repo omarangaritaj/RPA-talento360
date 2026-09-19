@@ -196,18 +196,29 @@ export function guardarFalloEvaluacion(clave, fila, { estado, mensaje, paginaOri
  * identifica al informe sin ambigüedad: `cargo` es el puesto y lo comparten
  * personas distintas, y el índice de fila se renumera en cada página.
  *
- * @param {{limite?:number, reintentarErrores?:boolean}} opciones
+ * @param {{limite?:number, reintentarErrores?:boolean, incluirSinRespuestas?:boolean,
+ *   estadoEval?:string|null}} opciones `estadoEval` filtra por el estado de la
+ *   evaluación —`CERRADA` o `ABIERTA`—, no por el del informe
  */
 export async function informesPendientes({
   limite = 0,
   reintentarErrores = false,
   incluirSinRespuestas = false,
+  estadoEval = null,
 } = {}) {
   const estados = [ESTADOS_INFORME.pendiente];
   if (reintentarErrores) estados.push(ESTADOS_INFORME.error);
 
   const filas = await Evaluacion.aggregate([
     { $match: { 'evaluados.informe.estado': { $in: estados } } },
+    /**
+     * Filtro por el estado de la EVALUACIÓN, no el del informe.
+     *
+     * Va aquí arriba a propósito, antes del `$unwind`: así Mongo descarta el
+     * documento entero en vez de expandir sus diez o veinte evaluados para
+     * tirarlos uno a uno después.
+     */
+    ...(estadoEval ? [{ $match: { estadoEval } }] : []),
     { $unwind: '$evaluados' },
     {
       $match: {
@@ -257,6 +268,57 @@ export async function informesPendientes({
   ]);
 
   return filas;
+}
+
+/**
+ * Estados de evaluación que hay realmente en la colección, con cuántos
+ * informes pendientes tiene cada uno.
+ *
+ * Existe para que un filtro que no encuentra nada pueda decir POR QUÉ. El
+ * valor de `estadoEval` se raspa de una celda del listado, así que basta con
+ * que la aplicación cambie "CERRADA" por "Cerrada" para que el filtro deje de
+ * encontrar cosas… y sin esto el programa se limitaría a anunciar que no hay
+ * nada pendiente, que es exactamente la clase de fallo silencioso que ya costó
+ * una corrida entera en este proyecto.
+ *
+ * @returns {Promise<Array<{estadoEval:string, evaluaciones:number, pendientes:number}>>}
+ */
+export async function estadosDeEvaluacion() {
+  const filas = await Evaluacion.aggregate([
+    {
+      $project: {
+        estadoEval: 1,
+        pendientes: {
+          $size: {
+            $filter: {
+              input: { $ifNull: ['$evaluados', []] },
+              as: 'e',
+              cond: {
+                $in: [
+                  '$$e.informe.estado',
+                  [ESTADOS_INFORME.pendiente, ESTADOS_INFORME.error],
+                ],
+              },
+            },
+          },
+        },
+      },
+    },
+    {
+      $group: {
+        _id: '$estadoEval',
+        evaluaciones: { $sum: 1 },
+        pendientes: { $sum: '$pendientes' },
+      },
+    },
+    { $sort: { pendientes: -1 } },
+  ]);
+
+  return filas.map((f) => ({
+    estadoEval: f._id ?? '(sin estado)',
+    evaluaciones: f.evaluaciones,
+    pendientes: f.pendientes,
+  }));
 }
 
 /** Marca un informe como descargado. `informe.id` es único dentro de su evaluación. */

@@ -30,6 +30,7 @@ import { abrirDetalle, recorrerPersonas, DetalleVacio } from '../evaluaciones/de
 import { cosecharUrl } from '../evaluaciones/cosecha-urls.js';
 import {
   claveDeEvaluacion,
+  estadosDeEvaluacion,
   informesPendientes,
   marcarInformeDescargado,
   marcarInformeError,
@@ -43,6 +44,12 @@ const log = (m) => console.log(`[${new Date().toLocaleTimeString('es-CO')}] ${m}
 const AYUDA = `
 Etapa 2 · fase 2 — descarga de los informes PDF
 
+  --solo-cerradas          sólo los informes de evaluaciones CERRADAS. Una
+                           evaluación abierta todavía puede recibir respuestas,
+                           así que su informe cambiará: bajarlo hoy es pagar
+                           tres minutos por un dato que caduca
+  --estado-eval <valor>    filtra por un estado concreto de la evaluación
+                           (CERRADA o ABIERTA). --solo-cerradas es su atajo
   --limite-eval <n>        procesa sólo n evaluaciones
   --sesiones <n>           sesiones en paralelo. Nunca más que cuentas haya en
                            .env: dos sesiones sobre la misma cuenta se pisan el
@@ -79,6 +86,8 @@ function leerArgumentos(argv) {
     // Por omisión se saltan los que no tienen ningún evaluador finalizado: el
     // servidor devuelve para ellos un esqueleto vacío, y cuesta tres minutos.
     incluirSinRespuestas: false,
+    /** Estado de la EVALUACIÓN por el que filtrar. null = todas. */
+    estadoEval: null,
     headless: true,
   };
 
@@ -89,6 +98,10 @@ function leerArgumentos(argv) {
     if (arg === '--limite-eval') o.limiteEval = Number(valor());
     else if (arg === '--sesiones') o.sesiones = Math.max(1, Number(valor()));
     else if (arg === '--destino') o.destino = valor();
+    else if (arg === '--solo-cerradas') o.estadoEval = 'CERRADA';
+    // Se normaliza a mayúsculas porque así vienen del listado ("CERRADA",
+    // "ABIERTA") y nadie debería tener que acordarse de eso al teclear.
+    else if (arg === '--estado-eval') o.estadoEval = (valor() ?? '').trim().toUpperCase();
     else if (arg === '--reintentar-errores') o.reintentarErrores = true;
     else if (arg === '--incluir-sin-respuestas') o.incluirSinRespuestas = true;
     else if (arg === '--headed') o.headless = false;
@@ -194,8 +207,40 @@ async function principal() {
   const pendientes = await informesPendientes({
     reintentarErrores: opciones.reintentarErrores,
     incluirSinRespuestas: opciones.incluirSinRespuestas,
+    estadoEval: opciones.estadoEval,
   });
   if (!pendientes.length) {
+    /**
+     * Si se filtró por estado y no salió nada, hay que decir POR QUÉ.
+     *
+     * `estadoEval` se raspa de una celda del listado, así que basta con que la
+     * aplicación cambie "CERRADA" por "Cerrada" para que el filtro deje de
+     * encontrar nada. Sin este aviso, el programa anunciaría que no queda
+     * trabajo pendiente —con más de cuatro mil informes esperando— y eso es
+     * justo la clase de fallo callado que ya costó una corrida entera aquí.
+     */
+    if (opciones.estadoEval) {
+      const estados = await estadosDeEvaluacion();
+      const existe = estados.some((e) => e.estadoEval === opciones.estadoEval);
+
+      console.log(`No hay informes pendientes con estadoEval "${opciones.estadoEval}".`);
+      if (!existe) {
+        console.log(
+          `\nATENCIÓN: ese estado NO EXISTE en la colección. Los que hay son:`
+        );
+      } else {
+        console.log('\nEstados disponibles:');
+      }
+      for (const e of estados) {
+        console.log(
+          `  ${e.estadoEval.padEnd(14)} ${String(e.evaluaciones).padStart(4)} evaluación(es), ` +
+            `${e.pendientes} informe(s) pendiente(s)`
+        );
+      }
+      await desconectar();
+      return;
+    }
+
     console.log('No hay informes pendientes. Usa --reintentar-errores para volver sobre los fallidos.');
     console.log('Estado:', await resumenInformes());
     await desconectar();
@@ -215,6 +260,9 @@ async function principal() {
   const asignadas = new Set(objetivo);
 
   log(`Pendientes: ${pendientes.length} informes en ${claves.length} evaluación(es)`);
+  if (opciones.estadoEval) {
+    log(`Filtro: sólo evaluaciones con estado ${opciones.estadoEval}.`);
+  }
   if (!opciones.incluirSinRespuestas) {
     log('Se saltan los evaluados sin ningún evaluador finalizado: su informe sale vacío.');
   }
